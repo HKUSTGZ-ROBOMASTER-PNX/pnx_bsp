@@ -6,11 +6,16 @@
 namespace bsp {
 
 enum class PwmInstance : uint8_t {
+    Tim3_Ch4,
     Tim12_Ch2,
 };
 
 constexpr bool pwm_is_enabled(PwmInstance inst) {
     switch (inst) {
+#if BSP_PWM_ENABLE_TIM3_CH4
+        case PwmInstance::Tim3_Ch4:
+            return true;
+#endif
 #if BSP_PWM_ENABLE_TIM12_CH2
         case PwmInstance::Tim12_Ch2:
             return true;

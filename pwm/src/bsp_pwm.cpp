@@ -13,6 +13,10 @@ struct PwmBinding {
 
 bool binding_for(bsp::PwmInstance inst, PwmBinding* out) {
     switch (inst) {
+        case bsp::PwmInstance::Tim3_Ch4:
+            out->timer = &htim3;
+            out->channel = TIM_CHANNEL_4;
+            return true;
         case bsp::PwmInstance::Tim12_Ch2:
             out->timer = &htim12;
             out->channel = TIM_CHANNEL_2;

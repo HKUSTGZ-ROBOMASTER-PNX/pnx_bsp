@@ -29,6 +29,9 @@ void init() {
 #if BSP_PWM_ENABLE_TIM12_CH2
     pwm_init<PwmInstance::Tim12_Ch2>();
 #endif
+#if BSP_PWM_ENABLE_TIM3_CH4
+    pwm_init<PwmInstance::Tim3_Ch4>();
+#endif
 #if BSP_ADC_ENABLE_ADC1
     adc_init<AdcInstance::Adc1>();
 #endif
