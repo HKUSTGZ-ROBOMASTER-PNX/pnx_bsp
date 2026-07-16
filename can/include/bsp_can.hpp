@@ -1,36 +1,39 @@
 #pragma once
 
-#include "bsp.hpp"
-
-#include "os.hpp"
+#include "config.hpp"
+#include "fdcan.h"
+#include "tx_api.h"
+#include "usertypes.hpp"
 
 #include <cstddef>
-#include <cstdint>
 
-namespace bsp {
+namespace bsp::can
+{
 
-enum class CanBus : uint8_t {
-    Bus1 = 0,
-    Bus2 = 1,
-    Bus3 = 2,
+struct rx_frame
+{
+    uint32_t id = 0;
+    uint8_t len = 0;
+    uint8_t data[64]{};
 };
 
-enum class CanType : uint8_t {
-    Classic = 0, ///< RxFifo0 + 错误中断（hfdcan2/3）
-    FD = 1,      ///< RxFifo1 + Tx 延迟补偿（hfdcan1）
-};
+using rx_handler = void (*)(bus bus, const rx_frame& frame, void* user_data);
 
-using CanRxCallback = void (*)(CanBus bus, uint32_t id, const uint8_t* data, uint8_t len,
-                               void* user_data);
+FDCAN_HandleTypeDef* handle_of(bus b) noexcept;
+bus bus_of(FDCAN_HandleTypeDef* handle) noexcept;
+bool bus_enabled(std::size_t index) noexcept;
+bus_type configured_bus_type(std::size_t index) noexcept;
+id_type filter_id_type_of(std::size_t index) noexcept;
 
-constexpr size_t kMaxCanRxCallbacks = 8;
+void receive(FDCAN_HandleTypeDef* handle, uint32_t rx_fifo, bus_type mode);
+void handle_error(FDCAN_HandleTypeDef* handle, uint32_t error_status_its);
 
-Status can_init(CanBus bus, CanType type);
-Status can_transmit(CanBus bus, uint32_t std_id, const uint8_t* data, uint16_t len);
+types::status init(bus bus, bus_type type);
+types::status transmit(bus bus, uint32_t id, const uint8_t* data, uint16_t len);
 
-Status can_register_rx_callback(CanBus bus, CanRxCallback callback, void* user_data);
-void can_unregister_rx_callbacks(CanBus bus);
+types::status register_rx_handler(bus bus, rx_handler handler, void* user_data);
+void unregister_rx_handlers(bus bus);
 
-os::Semaphore* can_error_sem(CanBus bus);
+TX_SEMAPHORE* err_sem(bus bus);
 
-} // namespace bsp
+} // namespace bsp::can

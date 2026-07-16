@@ -1,24 +1,34 @@
 #pragma once
 
-#include "bsp.hpp"
+#include "usertypes.hpp"
 
 #include <cstdint>
 
-namespace bsp {
+namespace bsp::dwt
+{
 
-struct DwtTime {
-    uint32_t s;
-    uint16_t ms;
-    uint16_t us;
+struct time
+{
+    std::uint32_t s = 0;
+    std::uint32_t ms = 0;
+    std::uint32_t us = 0;
 };
 
-void dwt_init(uint32_t cpu_freq_mhz);
-float dwt_delta_s(uint32_t* last_cnt);
-double dwt_delta_s64(uint32_t* last_cnt);
-float dwt_timeline_s();
-float dwt_timeline_ms();
-uint64_t dwt_timeline_us();
-void dwt_delay_s(float seconds);
-void dwt_update();
+types::status init();
+bool initialized();
 
-} // namespace bsp
+void update();
+const time& now();
+
+float timeline_s();
+float timeline_ms();
+std::uint64_t timeline_us();
+
+float delta_s(std::uint32_t* last_cnt);
+double delta_s64(std::uint32_t* last_cnt);
+
+void delay_s(float seconds);
+void delay_ms(std::uint32_t ms);
+void delay_us(std::uint32_t us);
+
+} // namespace bsp::dwt

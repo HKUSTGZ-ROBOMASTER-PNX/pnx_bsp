@@ -1,52 +1,30 @@
 #pragma once
 
-#include "bsp.hpp"
-#include "bsp_board.hpp"
+#include "config.hpp"
+#include "spi.h"
+#include "usertypes.hpp"
 
-#include <cstddef>
-#include <cstdint>
+namespace bsp::spi
+{
 
-namespace bsp {
-
-enum class SpiPort : uint8_t {
-    Spi2 = 2,
-    Spi6 = 6,
+enum class bus : uint8_t
+{
+    spi2 = 0,
+    spi6 = 1,
 };
 
-enum class SpiMode : uint8_t {
-    Block = 0,
-    IT = 1,
-    Dma = 2,
+enum class cs : uint8_t
+{
+    bmi088_acc = 0,
+    bmi088_gyro = 1,
 };
 
-constexpr bool spi_is_enabled(SpiPort port) {
-    switch (port) {
-#if BSP_SPI_ENABLE_SPI2
-        case SpiPort::Spi2:
-            return true;
-#endif
-#if BSP_SPI_ENABLE_SPI6
-        case SpiPort::Spi6:
-            return true;
-#endif
-        default:
-            return false;
-    }
-}
+types::status wait_ready(bus bus, uint32_t timeout_ms = 1000);
+bool bus_enabled(bus bus) noexcept;
+SPI_HandleTypeDef* handle_of(bus bus) noexcept;
+types::status init(bus bus);
+types::status transmit(bus bus, const uint8_t* data, size_t len, uint32_t timeout_ms);
+types::status receive(bus bus, uint8_t* data, size_t len, uint32_t timeout_ms);
+void cs_set(cs line, bool selected);
 
-Status spi_transmit_impl(SpiPort port, const uint8_t* data, uint8_t len, SpiMode mode);
-Status spi_receive_impl(SpiPort port, uint8_t* data, uint8_t len, SpiMode mode);
-
-template <SpiPort Port>
-Status spi_transmit(const uint8_t* data, uint8_t len, SpiMode mode = SpiMode::Block) {
-    static_assert(spi_is_enabled(Port), "SPI port not enabled in pnx_configs/bsp_board.hpp");
-    return spi_transmit_impl(Port, data, len, mode);
-}
-
-template <SpiPort Port>
-Status spi_receive(uint8_t* data, uint8_t len, SpiMode mode = SpiMode::Block) {
-    static_assert(spi_is_enabled(Port), "SPI port not enabled in pnx_configs/bsp_board.hpp");
-    return spi_receive_impl(Port, data, len, mode);
-}
-
-} // namespace bsp
+} // namespace bsp::spi
