@@ -1,6 +1,7 @@
 #include "bsp_can.hpp"
 
 #include <array>
+#include <atomic>
 
 namespace bsp::can
 {
@@ -9,26 +10,35 @@ namespace
 
 struct rx_slot
 {
-    rx_handler handler = nullptr;
-    void* user_data = nullptr;
+    std::atomic<rx_handler> handler{nullptr};
+    std::atomic<void*> user_data{nullptr};
 };
 
 struct telemetry_state
 {
-    volatile std::uint32_t rx_count = 0;
-    volatile std::uint32_t tx_count = 0;
-    volatile std::uint32_t last_id = 0;
-    volatile std::uint32_t last_tick = 0;
-    volatile std::uint32_t error_count = 0;
-    volatile std::uint32_t bus_off_count = 0;
-    volatile std::uint32_t drop_count = 0;
-    volatile state bus_state = state::stopped;
+    std::atomic<std::uint32_t> rx_count{0U};
+    std::atomic<std::uint32_t> tx_count{0U};
+    std::atomic<std::uint32_t> last_id{0U};
+    std::atomic<std::uint32_t> last_tick{0U};
+    std::atomic<std::uint32_t> error_count{0U};
+    std::atomic<std::uint32_t> bus_off_count{0U};
+    std::atomic<std::uint32_t> drop_count{0U};
+    std::atomic<std::uint32_t> bus_state{
+        static_cast<std::uint32_t>(state::stopped)};
 };
+
+static_assert(std::atomic<std::uint32_t>::is_always_lock_free,
+              "CAN ISR telemetry requires lock-free 32-bit atomics");
+static_assert(std::atomic<rx_handler>::is_always_lock_free,
+              "CAN ISR callback dispatch requires lock-free pointer atomics");
+static_assert(std::atomic<void*>::is_always_lock_free,
+              "CAN ISR callback context requires lock-free pointer atomics");
 
 std::array<bus_type, bus_count> active_types{};
 std::array<bool, bus_count> initialized{};
 std::array<std::array<rx_slot, max_rx_callbacks>, bus_count> rx_slots{};
 std::array<telemetry_state, bus_count> telemetry_states{};
+std::atomic<std::uint32_t> fault_epoch{0U};
 
 std::size_t index_of(bus selected) noexcept
 {
@@ -39,6 +49,12 @@ std::size_t index_of(bus selected) noexcept
 const bus_config* config_of(std::size_t index) noexcept
 {
     return index < bus_count ? &configs[index] : nullptr;
+}
+
+bool valid_transmit(std::size_t index, const std::uint8_t* data,
+                    std::uint16_t len) noexcept
+{
+    return index < bus_count && data != nullptr && len != 0U;
 }
 
 } // namespace
@@ -85,14 +101,20 @@ types::status init(bus selected, bus_type type)
     const types::status status = detail::backend_init(selected, type);
     if (status != types::status::ok)
     {
-        ++telemetry_states[index].error_count;
-        telemetry_states[index].bus_state = state::fault;
+        telemetry_states[index].bus_state.store(
+            static_cast<std::uint32_t>(state::fault),
+            std::memory_order_relaxed);
+        telemetry_states[index].error_count.fetch_add(
+            1U, std::memory_order_release);
+        fault_epoch.fetch_add(1U, std::memory_order_release);
         return status;
     }
 
     active_types[index] = type;
     initialized[index] = true;
-    telemetry_states[index].bus_state = state::active;
+    telemetry_states[index].bus_state.store(
+        static_cast<std::uint32_t>(state::active),
+        std::memory_order_release);
     return types::status::ok;
 }
 
@@ -100,7 +122,7 @@ types::status transmit(bus selected, std::uint32_t id, const std::uint8_t* data,
                        std::uint16_t len)
 {
     const std::size_t index = index_of(selected);
-    if (index >= bus_count || data == nullptr || len == 0U)
+    if (!valid_transmit(index, data, len))
     {
         return types::status::invalid_arg;
     }
@@ -117,11 +139,63 @@ types::status transmit(bus selected, std::uint32_t id, const std::uint8_t* data,
         detail::backend_transmit(selected, id, data, len);
     if (status == types::status::ok)
     {
-        ++telemetry_states[index].tx_count;
+        telemetry_states[index].tx_count.fetch_add(
+            1U, std::memory_order_relaxed);
     }
     else
     {
-        ++telemetry_states[index].error_count;
+        telemetry_states[index].error_count.fetch_add(
+            1U, std::memory_order_release);
+        fault_epoch.fetch_add(1U, std::memory_order_release);
+    }
+    return status;
+}
+
+types::status transmit_if_healthy(
+    bus selected, std::uint32_t id, const std::uint8_t* data,
+    std::uint16_t len, std::uint32_t expected_error_count,
+    std::uint32_t expected_drop_count,
+    std::uint32_t expected_fault_epoch)
+{
+    const std::size_t index = index_of(selected);
+    if (!valid_transmit(index, data, len))
+    {
+        return types::status::invalid_arg;
+    }
+    if (!bus_enabled(index))
+    {
+        return types::status::not_configured;
+    }
+    if (!initialized[index])
+    {
+        return types::status::error;
+    }
+
+    telemetry_state& stats = telemetry_states[index];
+    const std::uint32_t irq_state = detail::backend_enter_critical();
+    const bool healthy =
+        stats.error_count.load(std::memory_order_acquire) ==
+            expected_error_count &&
+        stats.drop_count.load(std::memory_order_acquire) ==
+            expected_drop_count &&
+        fault_epoch.load(std::memory_order_acquire) ==
+            expected_fault_epoch &&
+        static_cast<state>(
+            stats.bus_state.load(std::memory_order_acquire)) ==
+            state::active;
+    const types::status status =
+        healthy ? detail::backend_transmit(selected, id, data, len)
+                : types::status::error;
+    detail::backend_exit_critical(irq_state);
+
+    if (status == types::status::ok)
+    {
+        stats.tx_count.fetch_add(1U, std::memory_order_relaxed);
+    }
+    else if (healthy)
+    {
+        stats.error_count.fetch_add(1U, std::memory_order_release);
+        fault_epoch.fetch_add(1U, std::memory_order_release);
     }
     return status;
 }
@@ -141,10 +215,10 @@ types::status register_rx_handler(bus selected, rx_handler handler,
 
     for (auto& slot : rx_slots[index])
     {
-        if (slot.handler == nullptr)
+        if (slot.handler.load(std::memory_order_acquire) == nullptr)
         {
-            slot.user_data = user_data;
-            slot.handler = handler;
+            slot.user_data.store(user_data, std::memory_order_relaxed);
+            slot.handler.store(handler, std::memory_order_release);
             return types::status::ok;
         }
     }
@@ -160,8 +234,7 @@ void unregister_rx_handlers(bus selected)
     }
     for (auto& slot : rx_slots[index])
     {
-        slot.handler = nullptr;
-        slot.user_data = nullptr;
+        slot.handler.store(nullptr, std::memory_order_release);
     }
 }
 
@@ -176,15 +249,30 @@ telemetry snapshot(bus selected) noexcept
     }
 
     const telemetry_state& source = telemetry_states[index];
-    result.rx_count = source.rx_count;
-    result.tx_count = source.tx_count;
-    result.last_id = source.last_id;
-    result.last_tick = source.last_tick;
-    result.error_count = source.error_count;
-    result.bus_off_count = source.bus_off_count;
-    result.drop_count = source.drop_count;
-    result.bus_state = source.bus_state;
+    result.rx_count =
+        source.rx_count.load(std::memory_order_relaxed);
+    result.tx_count =
+        source.tx_count.load(std::memory_order_relaxed);
+    result.last_id =
+        source.last_id.load(std::memory_order_relaxed);
+    result.last_tick =
+        source.last_tick.load(std::memory_order_relaxed);
+    result.error_count =
+        source.error_count.load(std::memory_order_acquire);
+    result.bus_off_count =
+        source.bus_off_count.load(std::memory_order_relaxed);
+    result.drop_count =
+        source.drop_count.load(std::memory_order_acquire);
+    result.fault_epoch =
+        fault_epoch.load(std::memory_order_acquire);
+    result.bus_state = static_cast<state>(
+        source.bus_state.load(std::memory_order_acquire));
     return result;
+}
+
+std::uint32_t time_now() noexcept
+{
+    return detail::backend_tick_now();
 }
 
 namespace detail
@@ -199,18 +287,21 @@ void rx_from_isr(bus selected, const rx_frame& frame, std::uint32_t tick) noexce
     }
 
     telemetry_state& stats = telemetry_states[index];
-    ++stats.rx_count;
-    stats.last_id = frame.id;
-    stats.last_tick = tick;
-    stats.bus_state = state::active;
+    stats.rx_count.fetch_add(1U, std::memory_order_relaxed);
+    stats.last_id.store(frame.id, std::memory_order_relaxed);
+    stats.last_tick.store(tick, std::memory_order_relaxed);
 
     rx_frame stamped = frame;
     stamped.tick = tick;
     for (const auto& slot : rx_slots[index])
     {
-        if (slot.handler != nullptr)
+        const rx_handler handler =
+            slot.handler.load(std::memory_order_acquire);
+        if (handler != nullptr)
         {
-            slot.handler(selected, stamped, slot.user_data);
+            handler(
+                selected, stamped,
+                slot.user_data.load(std::memory_order_relaxed));
         }
     }
 }
@@ -223,13 +314,17 @@ void error_from_isr(bus selected, state next_state, std::uint32_t tick) noexcept
         return;
     }
     telemetry_state& stats = telemetry_states[index];
-    ++stats.error_count;
-    stats.last_tick = tick;
-    stats.bus_state = next_state;
+    stats.last_tick.store(tick, std::memory_order_relaxed);
+    stats.bus_state.store(
+        static_cast<std::uint32_t>(next_state),
+        std::memory_order_relaxed);
     if (next_state == state::bus_off)
     {
-        ++stats.bus_off_count;
+        stats.bus_off_count.fetch_add(
+            1U, std::memory_order_relaxed);
     }
+    stats.error_count.fetch_add(1U, std::memory_order_release);
+    fault_epoch.fetch_add(1U, std::memory_order_release);
 }
 
 void drop_from_isr(bus selected) noexcept
@@ -237,7 +332,9 @@ void drop_from_isr(bus selected) noexcept
     const std::size_t index = index_of(selected);
     if (index < bus_count)
     {
-        ++telemetry_states[index].drop_count;
+        telemetry_states[index].drop_count.fetch_add(
+            1U, std::memory_order_release);
+        fault_epoch.fetch_add(1U, std::memory_order_release);
     }
 }
 
