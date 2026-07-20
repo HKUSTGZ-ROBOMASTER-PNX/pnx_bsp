@@ -3,6 +3,7 @@
 #include "config.hpp"
 #include "usertypes.hpp"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 
@@ -14,6 +15,40 @@ enum class mode : std::uint8_t
     block = 0,
     dma = 1,
     it = 2,
+};
+
+enum class rx_delivery : std::uint8_t
+{
+    // Preserve the original ReceiveToIdle contract: ignore DMA HT/TC events
+    // for circular DMA and deliver one buffer-start snapshot on IDLE.
+    frame_snapshot = 0,
+    // Deliver newly written circular-DMA segments on HT, TC and IDLE.
+    stream_segments = 1,
+};
+
+inline constexpr std::size_t dma_cache_line_size = 32U;
+
+template <std::size_t LogicalSize>
+struct alignas(dma_cache_line_size) dma_rx_storage
+{
+    static_assert(LogicalSize > 0U);
+    static constexpr std::size_t logical_size = LogicalSize;
+    static constexpr std::size_t storage_size =
+        ((LogicalSize + dma_cache_line_size - 1U) /
+         dma_cache_line_size) *
+        dma_cache_line_size;
+
+    std::array<std::uint8_t, storage_size> bytes{};
+
+    std::uint8_t* data() noexcept
+    {
+        return bytes.data();
+    }
+
+    const std::uint8_t* data() const noexcept
+    {
+        return bytes.data();
+    }
 };
 
 struct rx_frame
@@ -34,14 +69,22 @@ struct telemetry
 using rx_handler = void (*)(port port, const rx_frame& frame, void* user_data);
 using notify_handler = void (*)(void* user_data);
 
+// RX handlers and notify handlers execute from the UART/DMA ISR. They must be
+// constant-time and non-blocking. The RX buffer must remain valid for the
+// lifetime of the active reception. On cache-equipped boards use
+// dma_rx_storage so cache maintenance cannot touch unrelated objects.
 bool port_enabled(port port) noexcept;
 types::status init(port port, mode mode);
+// DMA/IT transmit copies at most 256 bytes into board-owned staging storage;
+// the caller may release or reuse data after this function returns.
 types::status transmit(port port, const std::uint8_t* data, std::size_t len,
                        std::uint32_t timeout_ms);
 types::status start_rx_to_idle(port port, std::uint8_t* buffer, std::size_t len,
                                rx_handler handler, void* user_data,
                                notify_handler notify = nullptr,
-                               void* notify_user_data = nullptr);
+                               void* notify_user_data = nullptr,
+                               rx_delivery delivery =
+                                   rx_delivery::frame_snapshot);
 types::status restart_rx(port port);
 telemetry snapshot(port port) noexcept;
 
@@ -52,10 +95,12 @@ types::status backend_init(port port, mode mode) noexcept;
 types::status backend_transmit(port port, mode mode, const std::uint8_t* data,
                                std::size_t len, std::uint32_t timeout_ms) noexcept;
 types::status backend_start_rx(port port, mode mode, std::uint8_t* buffer,
-                               std::size_t len) noexcept;
+                               std::size_t len,
+                               rx_delivery delivery) noexcept;
 types::status backend_restart_rx(port port) noexcept;
 
 void rx_from_isr(port port, std::size_t len) noexcept;
+void rx_from_isr(port port, std::size_t offset, std::size_t len) noexcept;
 void error_from_isr(port port) noexcept;
 void tx_complete_from_isr(port port) noexcept;
 
