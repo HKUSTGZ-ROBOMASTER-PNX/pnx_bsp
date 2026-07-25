@@ -10,6 +10,24 @@
 namespace bsp::usb
 {
 
+enum class link_state : uint8_t
+{
+    uninitialized = 0,
+    initialized,
+    connected,
+    fault,
+};
+
+struct capabilities
+{
+    bool device_mode = false;
+    bool high_speed = false;
+    bool supports_vbus_sense = false;
+    uint16_t max_packet_size = 0;
+    uint16_t max_transfer_size = 0;
+    uint8_t tx_queue_depth = 0;
+};
+
 struct config
 {
     uint8_t read_priority = static_cast<uint8_t>(params::usb::read_thread_priority);
@@ -25,7 +43,9 @@ struct config
 
 struct runtime_state
 {
+    bool initialized = false;
     bool connected = false;
+    link_state link = link_state::uninitialized;
     bool read_busy = false;
     bool write_busy = false;
     uint32_t last_read_status = 0;
@@ -39,11 +59,36 @@ struct runtime_state
     uint32_t error_count = 0;
     uint32_t tx_wake_count = 0;
     uint32_t fill_count = 0;
+    uint32_t rx_bytes = 0;
+    uint32_t tx_bytes = 0;
+    uint32_t tx_drop_count = 0;
+    uint32_t connect_count = 0;
+    uint32_t disconnect_count = 0;
+    uint8_t tx_queue_size = 0;
+    uint8_t tx_queue_high_water = 0;
 };
 
-types::status init(const config& cfg);
-bool connected();
-const runtime_state& state();
+struct write_result
+{
+    types::status status = types::status::error;
+    uint16_t accepted = 0;
+};
+
+// Initializes and starts the selected board backend. The callbacks run in the
+// backend's ThreadX worker context and must not block indefinitely.
+types::status init(const config& cfg) noexcept;
+
+// Copies a complete transfer into a bounded two-entry queue. This API is for
+// thread context only; it never retains the caller's buffer.
+write_result write(const uint8_t* data, std::size_t len) noexcept;
+
+bool connected() noexcept;
+runtime_state snapshot() noexcept;
+capabilities get_capabilities() noexcept;
+
+// Compatibility view for existing callers. New code should use snapshot() so
+// it never keeps a reference to mutable telemetry.
+const runtime_state& state() noexcept;
 
 namespace detail
 {
