@@ -38,6 +38,7 @@ std::array<bus_type, bus_count> active_types{};
 std::array<bool, bus_count> initialized{};
 std::array<std::array<rx_slot, max_rx_callbacks>, bus_count> rx_slots{};
 std::array<telemetry_state, bus_count> telemetry_states{};
+std::array<std::atomic<bool>, bus_count> recovery_in_progress{};
 std::atomic<std::uint32_t> fault_epoch{0U};
 
 std::size_t index_of(bus selected) noexcept
@@ -118,6 +119,84 @@ types::status init(bus selected, bus_type type)
     return types::status::ok;
 }
 
+types::status recover(bus selected)
+{
+    const std::size_t index = index_of(selected);
+    if (index >= bus_count)
+    {
+        return types::status::invalid_arg;
+    }
+    if (!bus_enabled(index))
+    {
+        return types::status::not_configured;
+    }
+    if (!initialized[index])
+    {
+        return types::status::error;
+    }
+
+    telemetry_state& stats = telemetry_states[index];
+    if (static_cast<state>(
+            stats.bus_state.load(std::memory_order_acquire)) ==
+        state::active)
+    {
+        return types::status::ok;
+    }
+
+    bool expected = false;
+    if (!recovery_in_progress[index].compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel))
+    {
+        return types::status::busy;
+    }
+
+    const std::uint32_t irq_state = detail::backend_enter_critical();
+    const state current = static_cast<state>(
+        stats.bus_state.load(std::memory_order_acquire));
+    if (current != state::bus_off)
+    {
+        detail::backend_exit_critical(irq_state);
+        recovery_in_progress[index].store(
+            false, std::memory_order_release);
+        return current == state::active ? types::status::ok
+                                        : types::status::error;
+    }
+    stats.bus_state.store(
+        static_cast<std::uint32_t>(state::recovering),
+        std::memory_order_release);
+    detail::backend_exit_critical(irq_state);
+
+    const types::status status =
+        detail::backend_recover(selected);
+    const std::uint32_t completion_irq_state =
+        detail::backend_enter_critical();
+    const bool owns_transition =
+        static_cast<state>(
+            stats.bus_state.load(std::memory_order_acquire)) ==
+        state::recovering;
+    if (status == types::status::ok && owns_transition)
+    {
+        stats.bus_state.store(
+            static_cast<std::uint32_t>(state::active),
+            std::memory_order_release);
+    }
+    else if (owns_transition)
+    {
+        stats.bus_state.store(
+            static_cast<std::uint32_t>(state::fault),
+            std::memory_order_release);
+        stats.error_count.fetch_add(
+            1U, std::memory_order_release);
+        fault_epoch.fetch_add(1U, std::memory_order_release);
+    }
+    detail::backend_exit_critical(completion_irq_state);
+    recovery_in_progress[index].store(
+        false, std::memory_order_release);
+    return status == types::status::ok && owns_transition
+               ? types::status::ok
+               : types::status::error;
+}
+
 types::status transmit(bus selected, std::uint32_t id, const std::uint8_t* data,
                        std::uint16_t len)
 {
@@ -133,6 +212,16 @@ types::status transmit(bus selected, std::uint32_t id, const std::uint8_t* data,
     if (!initialized[index])
     {
         return types::status::error;
+    }
+    if (static_cast<state>(
+            telemetry_states[index].bus_state.load(
+                std::memory_order_acquire)) == state::bus_off)
+    {
+        const types::status recovery_status = recover(selected);
+        if (recovery_status != types::status::ok)
+        {
+            return recovery_status;
+        }
     }
 
     const types::status status =

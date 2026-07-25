@@ -24,6 +24,7 @@ enum class state : std::uint8_t
     warning,
     passive,
     bus_off,
+    recovering,
     fault,
 };
 
@@ -47,6 +48,8 @@ bus_type configured_bus_type(std::size_t index) noexcept;
 id_type filter_id_type_of(std::size_t index) noexcept;
 
 types::status init(bus bus, bus_type type);
+// Thread-context recovery only. ISRs report bus-off through error_from_isr().
+types::status recover(bus bus);
 types::status transmit(bus bus, std::uint32_t id, const std::uint8_t* data,
                        std::uint16_t len);
 types::status transmit_if_healthy(
@@ -67,6 +70,7 @@ types::status backend_init(bus bus, bus_type type) noexcept;
 types::status backend_transmit(bus bus, std::uint32_t id,
                                const std::uint8_t* data,
                                std::uint16_t len) noexcept;
+types::status backend_recover(bus bus) noexcept;
 std::uint32_t backend_tick_now() noexcept;
 std::uint32_t backend_enter_critical() noexcept;
 void backend_exit_critical(std::uint32_t state) noexcept;
