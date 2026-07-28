@@ -1,29 +1,21 @@
 #include "bsp_pwm.hpp"
 
+#include <array>
+#include <cmath>
+
 namespace
 {
 
-struct pwm_binding
+constexpr std::size_t tracked_channel_count = 8U;
+std::array<std::uint32_t, tracked_channel_count> periods_us{
+    20000U, 20000U, 20000U, 20000U,
+    20000U, 20000U, 20000U, 20000U};
+
+std::uint32_t* period_of(bsp::pwm::channel selected) noexcept
 {
-    TIM_HandleTypeDef* timer = nullptr;
-    uint32_t hal_channel = 0;
-};
-
-bool binding_for(bsp::pwm::channel ch, pwm_binding* out)
-{
-    if (out == nullptr)
-    {
-        return false;
-    }
-
-    if (!bsp::pwm::is_enabled(ch))
-    {
-        return false;
-    }
-
-    out->timer = bsp::pwm::timer_of(ch);
-    out->hal_channel = bsp::pwm::hal_channel_of(ch);
-    return out->timer != nullptr && out->hal_channel != 0U;
+    return selected.value < periods_us.size()
+               ? &periods_us[selected.value]
+               : nullptr;
 }
 
 } // namespace
@@ -31,133 +23,85 @@ bool binding_for(bsp::pwm::channel ch, pwm_binding* out)
 namespace bsp::pwm
 {
 
-namespace
+bool is_enabled(channel selected) noexcept
 {
-
-const channel_config* config_of(channel ch) noexcept
-{
-    const auto index = static_cast<std::size_t>(ch);
-    return index < channel_count ? &configs[index] : nullptr;
+    return detail::backend_enabled(selected);
 }
 
-TIM_HandleTypeDef* timer_from_id(timer_id id) noexcept
+types::status start(channel selected) noexcept
 {
-    switch (id)
-    {
-    case timer_id::tim3:
-        return &htim3;
-    case timer_id::tim12:
-        return &htim12;
-    default:
-        return nullptr;
-    }
+    return is_enabled(selected)
+               ? detail::backend_start(selected)
+               : types::status::not_configured;
 }
 
-std::uint32_t hal_channel_from_id(channel_id id) noexcept
+types::status stop(channel selected) noexcept
 {
-    switch (id)
-    {
-    case channel_id::ch1:
-        return TIM_CHANNEL_1;
-    case channel_id::ch2:
-        return TIM_CHANNEL_2;
-    case channel_id::ch3:
-        return TIM_CHANNEL_3;
-    case channel_id::ch4:
-        return TIM_CHANNEL_4;
-    default:
-        return 0;
-    }
+    return is_enabled(selected)
+               ? detail::backend_stop(selected)
+               : types::status::not_configured;
 }
 
-} // namespace
-
-TIM_HandleTypeDef* timer_of(channel ch) noexcept
+types::status set_period_us(channel selected,
+                            std::uint32_t period_us) noexcept
 {
-    const channel_config* cfg = config_of(ch);
-    return cfg != nullptr && cfg->enabled ? timer_from_id(cfg->timer) : nullptr;
+    std::uint32_t* current = period_of(selected);
+    if (!is_enabled(selected))
+    {
+        return types::status::not_configured;
+    }
+    if (current == nullptr || period_us == 0U)
+    {
+        return types::status::invalid_arg;
+    }
+
+    const types::status result =
+        detail::backend_set_period_us(selected, period_us);
+    if (result == types::status::ok)
+    {
+        *current = period_us;
+    }
+    return result;
 }
 
-std::uint32_t hal_channel_of(channel ch) noexcept
+types::status set_pulse_us(channel selected,
+                           std::uint32_t pulse_us) noexcept
 {
-    const channel_config* cfg = config_of(ch);
-    return cfg != nullptr && cfg->enabled ? hal_channel_from_id(cfg->channel) : 0;
+    std::uint32_t* current = period_of(selected);
+    if (!is_enabled(selected))
+    {
+        return types::status::not_configured;
+    }
+    if (current == nullptr || pulse_us > *current)
+    {
+        return types::status::invalid_arg;
+    }
+    return detail::backend_set_pulse_us(selected, pulse_us);
 }
 
-types::status start(channel ch)
+types::status set_duty(channel selected, float duty_ratio) noexcept
 {
-    pwm_binding binding{};
-    if (!binding_for(ch, &binding))
+    std::uint32_t* current = period_of(selected);
+    if (!is_enabled(selected))
     {
-        return is_enabled(ch) ? types::status::invalid_arg : types::status::not_configured;
+        return types::status::not_configured;
     }
-
-    __HAL_TIM_SET_COMPARE(binding.timer, binding.hal_channel, 0);
-    if (HAL_TIM_PWM_Start(binding.timer, binding.hal_channel) != HAL_OK)
+    if (current == nullptr || !std::isfinite(duty_ratio))
     {
-        return types::status::error;
+        return types::status::invalid_arg;
     }
-
-    return types::status::ok;
-}
-
-types::status stop(channel ch)
-{
-    pwm_binding binding{};
-    if (!binding_for(ch, &binding))
+    if (duty_ratio < 0.0F)
     {
-        return is_enabled(ch) ? types::status::invalid_arg : types::status::not_configured;
+        duty_ratio = 0.0F;
     }
-
-    if (HAL_TIM_PWM_Stop(binding.timer, binding.hal_channel) != HAL_OK)
+    else if (duty_ratio > 1.0F)
     {
-        return types::status::error;
+        duty_ratio = 1.0F;
     }
-
-    return types::status::ok;
-}
-
-void set_period(channel ch, float period_s)
-{
-    pwm_binding binding{};
-    if (!binding_for(ch, &binding) || period_s <= 0.0f)
-    {
-        return;
-    }
-
-    const uint32_t prescaler = binding.timer->Init.Prescaler + 1U;
-    const channel_config* cfg = config_of(ch);
-    const uint32_t source_clock_hz = cfg != nullptr ? cfg->timer_clock_hz : 0U;
-    if (source_clock_hz == 0U)
-    {
-        return;
-    }
-
-    __HAL_TIM_SET_AUTORELOAD(
-        binding.timer,
-        static_cast<uint32_t>(period_s * (static_cast<float>(source_clock_hz) / static_cast<float>(prescaler))));
-}
-
-void set_duty(channel ch, float duty_ratio)
-{
-    pwm_binding binding{};
-    if (!binding_for(ch, &binding))
-    {
-        return;
-    }
-
-    if (duty_ratio < 0.0f)
-    {
-        duty_ratio = 0.0f;
-    }
-    if (duty_ratio > 1.0f)
-    {
-        duty_ratio = 1.0f;
-    }
-
-    const uint32_t period = __HAL_TIM_GET_AUTORELOAD(binding.timer) + 1U;
-    __HAL_TIM_SET_COMPARE(binding.timer, binding.hal_channel,
-                          static_cast<uint32_t>(duty_ratio * static_cast<float>(period)));
+    return set_pulse_us(
+        selected,
+        static_cast<std::uint32_t>(
+            duty_ratio * static_cast<float>(*current)));
 }
 
 } // namespace bsp::pwm
