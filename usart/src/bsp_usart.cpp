@@ -179,7 +179,11 @@ types::status restart_rx(port selected)
         return types::status::invalid_arg;
     }
     const types::status status = detail::backend_restart_rx(selected);
-    if (status != types::status::ok)
+    if (status == types::status::busy)
+    {
+        ctx->busy_count.fetch_add(1U, std::memory_order_relaxed);
+    }
+    else if (status != types::status::ok)
     {
         ctx->error_count.fetch_add(1U, std::memory_order_relaxed);
     }
