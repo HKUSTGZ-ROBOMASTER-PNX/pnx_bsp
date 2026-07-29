@@ -1,12 +1,12 @@
 name: Notify Feishu on Push
 
 on:
-  # 监听所有分支的 push，不监听 tag
+  # 只监听 main 分支的 push
   push:
     branches:
-      - "**"
+      - main
 
-  # 允许在 GitHub Actions 页面手动测试
+  # 保留手动测试入口
   workflow_dispatch:
 
 permissions:
