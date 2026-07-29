@@ -35,6 +35,7 @@ struct port_state
     TX_SEMAPHORE* notify_sem = nullptr;
     uint8_t* rx_buffer = nullptr;
     size_t rx_buffer_len = 0;
+    size_t rx_position = 0;
 };
 
 port_state ports[bsp::usart::port_count]{};
@@ -129,15 +130,15 @@ void invalidate_dcache_region(const void* buffer, size_t len)
 #endif
 }
 
-void notify_rx(bsp::usart::port port, size_t len)
+void notify_rx(bsp::usart::port port, uint8_t* data, size_t len)
 {
     port_state* ctx = state_of(port);
-    if (ctx == nullptr || ctx->rx_buffer == nullptr)
+    if (ctx == nullptr || data == nullptr || len == 0)
     {
         return;
     }
 
-    bsp::usart::rx_frame frame{ctx->rx_buffer, len};
+    bsp::usart::rx_frame frame{data, len};
     if (ctx->notify_sem != nullptr)
     {
         tx_semaphore_put(ctx->notify_sem);
@@ -297,6 +298,7 @@ types::status restart_rx(port port)
     }
 
     disable_rx_half_transfer_irq(handle);
+    ctx->rx_position = 0;
     invalidate_dcache_region(ctx->rx_buffer, ctx->rx_buffer_len);
 
     return types::status::ok;
@@ -317,17 +319,47 @@ void receive(UART_HandleTypeDef* handle, uint16_t size)
         return;
     }
 
-    if (rx_dma_is_circular(handle) && event == HAL_UART_RXEVENT_TC)
+    if (rx_dma_is_circular(handle))
     {
+        const size_t buffer_len = ctx->rx_buffer_len;
+        const size_t position = size < buffer_len ? size : 0U;
+
+        if (event == HAL_UART_RXEVENT_TC)
+        {
+            if (ctx->rx_position < buffer_len)
+            {
+                const size_t len = buffer_len - ctx->rx_position;
+                invalidate_dcache_region(ctx->rx_buffer + ctx->rx_position, len);
+                notify_rx(port, ctx->rx_buffer + ctx->rx_position, len);
+            }
+            ctx->rx_position = 0;
+            return;
+        }
+
+        if (position > ctx->rx_position)
+        {
+            const size_t len = position - ctx->rx_position;
+            invalidate_dcache_region(ctx->rx_buffer + ctx->rx_position, len);
+            notify_rx(port, ctx->rx_buffer + ctx->rx_position, len);
+        }
+        else if (position < ctx->rx_position)
+        {
+            const size_t tail_len = buffer_len - ctx->rx_position;
+            invalidate_dcache_region(ctx->rx_buffer + ctx->rx_position, tail_len);
+            notify_rx(port, ctx->rx_buffer + ctx->rx_position, tail_len);
+            if (position > 0U)
+            {
+                invalidate_dcache_region(ctx->rx_buffer, position);
+                notify_rx(port, ctx->rx_buffer, position);
+            }
+        }
+        ctx->rx_position = position;
         return;
     }
 
     invalidate_dcache_region(ctx->rx_buffer, size);
-    notify_rx(port, size);
-    if (!rx_dma_is_circular(handle))
-    {
-        restart_rx(port);
-    }
+    notify_rx(port, ctx->rx_buffer, size);
+    restart_rx(port);
 }
 
 void handle_error(UART_HandleTypeDef* handle)
@@ -380,6 +412,74 @@ types::status init(port port, mode mode)
     __HAL_UART_SEND_REQ(handle, UART_RXDATA_FLUSH_REQUEST);
     ctx->port_mode = mode;
     ctx->initialized = true;
+    return types::status::ok;
+}
+
+types::status configure(port port, const line_config& config)
+{
+    if (port >= port_count || config.baud_rate == 0U ||
+        (!config.enable_tx && !config.enable_rx))
+    {
+        return types::status::invalid_arg;
+    }
+
+    UART_HandleTypeDef* handle = handle_of(port);
+    port_state* ctx = state_of(port);
+    if (handle == nullptr || ctx == nullptr || ctx->rx_buffer != nullptr)
+    {
+        return types::status::invalid_arg;
+    }
+
+    switch (config.data_bits)
+    {
+    case word_length::bits_8:
+        handle->Init.WordLength = UART_WORDLENGTH_8B;
+        break;
+    case word_length::bits_9:
+        handle->Init.WordLength = UART_WORDLENGTH_9B;
+        break;
+    default:
+        return types::status::invalid_arg;
+    }
+
+    switch (config.stop)
+    {
+    case stop_bits::one:
+        handle->Init.StopBits = UART_STOPBITS_1;
+        break;
+    case stop_bits::two:
+        handle->Init.StopBits = UART_STOPBITS_2;
+        break;
+    default:
+        return types::status::invalid_arg;
+    }
+
+    switch (config.parity_mode)
+    {
+    case parity::none:
+        handle->Init.Parity = UART_PARITY_NONE;
+        break;
+    case parity::even:
+        handle->Init.Parity = UART_PARITY_EVEN;
+        break;
+    case parity::odd:
+        handle->Init.Parity = UART_PARITY_ODD;
+        break;
+    default:
+        return types::status::invalid_arg;
+    }
+
+    handle->Init.BaudRate = config.baud_rate;
+    handle->Init.Mode =
+        (config.enable_tx ? UART_MODE_TX : 0U) | (config.enable_rx ? UART_MODE_RX : 0U);
+    handle->Init.HwFlowCtl = UART_HWCONTROL_NONE;
+
+    if (HAL_UART_Init(handle) != HAL_OK)
+    {
+        return types::status::error;
+    }
+
+    ctx->initialized = false;
     return types::status::ok;
 }
 
@@ -485,6 +585,7 @@ types::status start_rx_to_idle(port port, uint8_t* buffer, size_t len, rx_handle
 
     ctx->rx_buffer = buffer;
     ctx->rx_buffer_len = len;
+    ctx->rx_position = 0;
     ctx->handler = handler;
     ctx->user_data = user_data;
     ctx->notify_sem = notify_sem;
