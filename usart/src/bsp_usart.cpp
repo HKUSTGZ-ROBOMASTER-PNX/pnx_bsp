@@ -11,6 +11,7 @@ extern DMA_HandleTypeDef hdma_uart7_rx;
 extern DMA_HandleTypeDef hdma_uart7_tx;
 extern DMA_HandleTypeDef hdma_usart1_rx;
 extern DMA_HandleTypeDef hdma_usart1_tx;
+extern DMA_HandleTypeDef hdma_usart10_rx;
 }
 
 namespace
@@ -193,6 +194,8 @@ UART_HandleTypeDef* handle_from_id(handle_id id) noexcept
         return &huart7;
     case handle_id::usart1:
         return &huart1;
+    case handle_id::usart10:
+        return &huart10;
     default:
         return nullptr;
     }
@@ -208,6 +211,8 @@ DMA_HandleTypeDef* rx_dma_from_id(handle_id id) noexcept
         return &hdma_uart7_rx;
     case handle_id::usart1:
         return &hdma_usart1_rx;
+    case handle_id::usart10:
+        return &hdma_usart10_rx;
     default:
         return nullptr;
     }
