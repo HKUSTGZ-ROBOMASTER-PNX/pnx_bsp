@@ -10,6 +10,24 @@
 namespace bsp::usb
 {
 
+enum class link_state : uint8_t
+{
+    uninitialized = 0,
+    initialized,
+    connected,
+    fault,
+};
+
+struct capabilities
+{
+    bool device_mode = false;
+    bool high_speed = false;
+    bool supports_vbus_sense = false;
+    uint16_t max_packet_size = 0;
+    uint16_t max_transfer_size = 0;
+    uint8_t tx_queue_depth = 0;
+};
+
 struct config
 {
     uint8_t read_priority = static_cast<uint8_t>(params::usb::read_thread_priority);
@@ -25,7 +43,9 @@ struct config
 
 struct runtime_state
 {
+    bool initialized = false;
     bool connected = false;
+    link_state link = link_state::uninitialized;
     bool read_busy = false;
     bool write_busy = false;
     uint32_t last_read_status = 0;
@@ -39,11 +59,47 @@ struct runtime_state
     uint32_t error_count = 0;
     uint32_t tx_wake_count = 0;
     uint32_t fill_count = 0;
+    uint32_t rx_bytes = 0;
+    uint32_t tx_bytes = 0;
+    uint32_t tx_drop_count = 0;
+    uint32_t connect_count = 0;
+    uint32_t disconnect_count = 0;
+    uint8_t tx_queue_size = 0;
+    uint8_t tx_queue_high_water = 0;
 };
 
-types::status init(const config& cfg);
-bool connected();
-const runtime_state& state();
+struct write_result
+{
+    types::status status = types::status::error;
+    uint16_t accepted = 0;
+};
+
+// Accepts the configuration, retains its callbacks/user context, creates the
+// required resources and schedules asynchronous controller startup. An `ok`
+// result does not mean the device has enumerated or that the transport is
+// connected/ready. Repeating init with the identical configuration is
+// idempotent; an incompatible configuration is rejected so callback ownership
+// cannot be replaced silently.
+//
+// Callbacks execute in implementation-owned thread context, never retain their
+// provided buffers beyond the call, and must remain bounded/non-blocking.
+// Disconnect may suppress completion for a retired transfer.
+types::status init(const config& cfg) noexcept;
+
+// Copies a complete transfer into a bounded two-entry queue. This API is for
+// thread context only; it never retains the caller's buffer. Calls made before
+// connected() becomes true, after disconnect, or while the bounded queue cannot
+// accept the transfer return an explicit non-ok status without waiting.
+write_result write(const uint8_t* data, std::size_t len) noexcept;
+
+// True only while the selected board's CDC transport is usable.
+bool connected() noexcept;
+runtime_state snapshot() noexcept;
+capabilities get_capabilities() noexcept;
+
+// Compatibility view for existing callers. New code should use snapshot() so
+// it never keeps a reference to mutable telemetry.
+const runtime_state& state() noexcept;
 
 namespace detail
 {

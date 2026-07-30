@@ -1,6 +1,6 @@
 #include "bsp_dwt.hpp"
 
-#include "stm32h7xx.h"
+#include "pnx_cmsis_device.h"
 
 namespace
 {
