@@ -17,6 +17,35 @@ enum class mode : std::uint8_t
     it = 2,
 };
 
+enum class word_length : std::uint8_t
+{
+    bits_8 = 0,
+    bits_9,
+};
+
+enum class stop_bits : std::uint8_t
+{
+    one = 0,
+    two,
+};
+
+enum class parity : std::uint8_t
+{
+    none = 0,
+    even,
+    odd,
+};
+
+struct line_config
+{
+    std::uint32_t baud_rate = 115200U;
+    word_length data_bits = word_length::bits_8;
+    stop_bits stop = stop_bits::one;
+    parity parity_mode = parity::none;
+    bool enable_tx = true;
+    bool enable_rx = true;
+};
+
 enum class rx_delivery : std::uint8_t
 {
     // Preserve the original ReceiveToIdle contract: ignore DMA HT/TC events
@@ -77,6 +106,7 @@ bool port_enabled(port port) noexcept;
 types::status init(port port, mode mode);
 // DMA/IT transmit copies at most 256 bytes into board-owned staging storage;
 // the caller may release or reuse data after this function returns.
+types::status configure(port port, const line_config& config);
 types::status transmit(port port, const std::uint8_t* data, std::size_t len,
                        std::uint32_t timeout_ms);
 types::status start_rx_to_idle(port port, std::uint8_t* buffer, std::size_t len,
