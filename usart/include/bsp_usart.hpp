@@ -88,22 +88,4 @@ types::status start_rx_to_idle(port port, std::uint8_t* buffer, std::size_t len,
 types::status restart_rx(port port);
 telemetry snapshot(port port) noexcept;
 
-namespace detail
-{
-
-types::status backend_init(port port, mode mode) noexcept;
-types::status backend_transmit(port port, mode mode, const std::uint8_t* data,
-                               std::size_t len, std::uint32_t timeout_ms) noexcept;
-types::status backend_start_rx(port port, mode mode, std::uint8_t* buffer,
-                               std::size_t len,
-                               rx_delivery delivery) noexcept;
-types::status backend_restart_rx(port port) noexcept;
-
-void rx_from_isr(port port, std::size_t len) noexcept;
-void rx_from_isr(port port, std::size_t offset, std::size_t len) noexcept;
-void error_from_isr(port port) noexcept;
-void tx_complete_from_isr(port port) noexcept;
-
-} // namespace detail
-
 } // namespace bsp::usart

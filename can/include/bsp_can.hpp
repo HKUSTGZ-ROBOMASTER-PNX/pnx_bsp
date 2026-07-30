@@ -48,7 +48,7 @@ bus_type configured_bus_type(std::size_t index) noexcept;
 id_type filter_id_type_of(std::size_t index) noexcept;
 
 types::status init(bus bus, bus_type type);
-// Thread-context recovery only. ISRs report bus-off through error_from_isr().
+// Thread-context recovery only; board ISR paths must only record or schedule it.
 types::status recover(bus bus);
 types::status transmit(bus bus, std::uint32_t id, const std::uint8_t* data,
                        std::uint16_t len);
@@ -62,23 +62,5 @@ types::status register_rx_handler(bus bus, rx_handler handler, void* user_data);
 void unregister_rx_handlers(bus bus);
 telemetry snapshot(bus bus) noexcept;
 std::uint32_t time_now() noexcept;
-
-namespace detail
-{
-
-types::status backend_init(bus bus, bus_type type) noexcept;
-types::status backend_transmit(bus bus, std::uint32_t id,
-                               const std::uint8_t* data,
-                               std::uint16_t len) noexcept;
-types::status backend_recover(bus bus) noexcept;
-std::uint32_t backend_tick_now() noexcept;
-std::uint32_t backend_enter_critical() noexcept;
-void backend_exit_critical(std::uint32_t state) noexcept;
-
-void rx_from_isr(bus bus, const rx_frame& frame, std::uint32_t tick) noexcept;
-void error_from_isr(bus bus, state next_state, std::uint32_t tick) noexcept;
-void drop_from_isr(bus bus) noexcept;
-
-} // namespace detail
 
 } // namespace bsp::can

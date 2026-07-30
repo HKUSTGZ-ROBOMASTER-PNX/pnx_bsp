@@ -16,6 +16,11 @@ struct bus
         : value(selected)
     {
     }
+
+    // Compatibility names used by the template Device layer. They are logical
+    // slots here; the selected board implementation owns the physical mapping.
+    static const bus spi2;
+    static const bus spi6;
 };
 
 struct chip_select
@@ -27,6 +32,9 @@ struct chip_select
         : value(selected)
     {
     }
+
+    static const chip_select bmi088_acc;
+    static const chip_select bmi088_gyro;
 };
 
 constexpr bool operator==(bus lhs, bus rhs) noexcept
@@ -46,6 +54,12 @@ constexpr bool operator==(chip_select lhs, chip_select rhs) noexcept
 
 inline constexpr bus no_bus{};
 inline constexpr chip_select no_select{};
+inline constexpr bus bus::spi2{0U};
+inline constexpr bus bus::spi6{1U};
+inline constexpr chip_select chip_select::bmi088_acc{0U};
+inline constexpr chip_select chip_select::bmi088_gyro{1U};
+
+using cs = chip_select;
 
 bool bus_enabled(bus selected) noexcept;
 bool select_enabled(chip_select selected) noexcept;
@@ -60,22 +74,6 @@ types::status receive(
     std::uint32_t timeout_ms) noexcept;
 types::status set_select(
     chip_select selected, bool active) noexcept;
-
-namespace detail
-{
-bool backend_bus_enabled(bus selected) noexcept;
-bool backend_select_enabled(chip_select selected) noexcept;
-types::status backend_init(bus selected) noexcept;
-types::status backend_wait_ready(
-    bus selected, std::uint32_t timeout_ms) noexcept;
-types::status backend_transmit(
-    bus selected, const std::uint8_t* data, std::size_t len,
-    std::uint32_t timeout_ms) noexcept;
-types::status backend_receive(
-    bus selected, std::uint8_t* data, std::size_t len,
-    std::uint32_t timeout_ms) noexcept;
-types::status backend_set_select(
-    chip_select selected, bool active) noexcept;
-} // namespace detail
+void cs_set(cs selected, bool active) noexcept;
 
 } // namespace bsp::spi

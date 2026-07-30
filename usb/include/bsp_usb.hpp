@@ -74,14 +74,25 @@ struct write_result
     uint16_t accepted = 0;
 };
 
-// Initializes and starts the selected board backend. The callbacks run in the
-// backend's ThreadX worker context and must not block indefinitely.
+// Accepts the configuration, retains its callbacks/user context, creates the
+// required resources and schedules asynchronous controller startup. An `ok`
+// result does not mean the device has enumerated or that the transport is
+// connected/ready. Repeating init with the identical configuration is
+// idempotent; an incompatible configuration is rejected so callback ownership
+// cannot be replaced silently.
+//
+// Callbacks execute in implementation-owned thread context, never retain their
+// provided buffers beyond the call, and must remain bounded/non-blocking.
+// Disconnect may suppress completion for a retired transfer.
 types::status init(const config& cfg) noexcept;
 
 // Copies a complete transfer into a bounded two-entry queue. This API is for
-// thread context only; it never retains the caller's buffer.
+// thread context only; it never retains the caller's buffer. Calls made before
+// connected() becomes true, after disconnect, or while the bounded queue cannot
+// accept the transfer return an explicit non-ok status without waiting.
 write_result write(const uint8_t* data, std::size_t len) noexcept;
 
+// True only while the selected board's CDC transport is usable.
 bool connected() noexcept;
 runtime_state snapshot() noexcept;
 capabilities get_capabilities() noexcept;
