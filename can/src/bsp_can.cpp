@@ -1,4 +1,5 @@
 #include "bsp_can.hpp"
+#include "bsp_can_diag.hpp"
 
 #include <array>
 #include <algorithm>
@@ -187,6 +188,10 @@ types::status init_classic(bus bus)
                             FDCAN_IT_ARB_PROTOCOL_ERROR |
                             FDCAN_IT_DATA_PROTOCOL_ERROR |
                             FDCAN_IT_BUS_OFF;
+    if constexpr (config::feature::can_diag)
+    {
+        notification |= FDCAN_IT_RX_FIFO0_MESSAGE_LOST | FDCAN_IT_RX_FIFO1_MESSAGE_LOST;
+    }
 
     FDCAN_HandleTypeDef* handle = handle_of(bus);
     if (handle == nullptr)
@@ -217,6 +222,10 @@ types::status init_fd(bus bus)
                             FDCAN_IT_ARB_PROTOCOL_ERROR |
                             FDCAN_IT_DATA_PROTOCOL_ERROR |
                             FDCAN_IT_BUS_OFF;
+    if constexpr (config::feature::can_diag)
+    {
+        notification |= FDCAN_IT_RX_FIFO0_MESSAGE_LOST | FDCAN_IT_RX_FIFO1_MESSAGE_LOST;
+    }
 
     FDCAN_HandleTypeDef* handle = handle_of(bus);
     if (handle == nullptr)
@@ -278,6 +287,10 @@ types::status transmit_frame(bus bus,
     {
         return types::status::error;
     }
+    if constexpr (config::feature::can_diag)
+    {
+        ++can_diag_bus[static_cast<std::size_t>(bus)].tx_attempts_total;
+    }
     return types::status::ok;
 }
 
@@ -305,7 +318,31 @@ void handle_error(FDCAN_HandleTypeDef* handle, uint32_t error_status_its)
 {
     const auto bus = bus_of(handle);
     const std::size_t idx = static_cast<std::size_t>(bus);
-    if (idx >= bus_count || active_types[idx] != bus_type::classic)
+    if (idx >= bus_count)
+    {
+        return;
+    }
+
+    if constexpr (config::feature::can_diag)
+    {
+        if ((error_status_its & FDCAN_IT_ERROR_WARNING) != 0U)
+        {
+            ++can_diag_bus[idx].warning_total;
+            ++can_diag_bus[idx].err_events_total;
+        }
+        if ((error_status_its & FDCAN_IT_ERROR_PASSIVE) != 0U)
+        {
+            ++can_diag_bus[idx].passive_total;
+            ++can_diag_bus[idx].err_events_total;
+        }
+        if ((error_status_its & FDCAN_IT_BUS_OFF) != 0U)
+        {
+            ++can_diag_bus[idx].busoff_total;
+            ++can_diag_bus[idx].err_events_total;
+        }
+    }
+
+    if (active_types[idx] != bus_type::classic)
     {
         return;
     }
@@ -346,8 +383,12 @@ void receive(FDCAN_HandleTypeDef* handle, uint32_t rx_fifo, bus_type mode)
 
     frame.id = rx_header.Identifier;
     frame.len = dlc_to_len(rx_header.DataLength);
+    if constexpr (config::feature::can_diag)
+    {
+        ++can_diag_bus[idx].rx_frames_total;
+    }
     notify_rx(bus, frame);
-}
+}// ?多态完了我怎么知道对应哪个can 哪个id有回调
 
 types::status init(bus bus, bus_type type)
 {
@@ -371,6 +412,11 @@ types::status init(bus bus, bus_type type)
     if (status != types::status::ok)
     {
         return status;
+    }
+
+    if constexpr (config::feature::can_diag)
+    {
+        bsp::can::diag::init(); // 惰性创建采样定时器（只创建一次）
     }
 
     if (type == bus_type::classic)
@@ -489,12 +535,26 @@ TX_SEMAPHORE* err_sem(bus bus)
 
 extern "C" void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef* hfdcan, uint32_t RxFifo0ITs)
 {
+    if constexpr (config::feature::can_diag)
+    {
+        if ((RxFifo0ITs & FDCAN_IT_RX_FIFO0_MESSAGE_LOST) != 0U)
+        {
+            ++can_diag_bus[static_cast<std::size_t>(bsp::can::bus_of(hfdcan))].rx_overrun_total;
+        }
+    }
     (void)RxFifo0ITs;
     bsp::can::receive(hfdcan, FDCAN_RX_FIFO0, bsp::can::bus_type::classic);
 }
 
 extern "C" void HAL_FDCAN_RxFifo1Callback(FDCAN_HandleTypeDef* hfdcan, uint32_t RxFifo1ITs)
 {
+    if constexpr (config::feature::can_diag)
+    {
+        if ((RxFifo1ITs & FDCAN_IT_RX_FIFO1_MESSAGE_LOST) != 0U)
+        {
+            ++can_diag_bus[static_cast<std::size_t>(bsp::can::bus_of(hfdcan))].rx_overrun_total;
+        }
+    }
     (void)RxFifo1ITs;
     bsp::can::receive(hfdcan, FDCAN_RX_FIFO1, bsp::can::bus_type::fd);
 }
