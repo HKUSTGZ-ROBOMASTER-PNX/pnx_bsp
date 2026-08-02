@@ -52,6 +52,19 @@ types::status init(bus bus, bus_type type);
 types::status recover(bus bus);
 types::status transmit(bus bus, std::uint32_t id, const std::uint8_t* data,
                        std::uint16_t len);
+// DEFERRED / PROVISIONAL -- no production caller as of 2026-08.
+//
+// Guarded transmit: sends only if the bus counters still match what the caller
+// last observed via snapshot(), so a caller can refuse to transmit onto a bus
+// that has degraded since its last check. Currently exercised only by the host
+// contract tests (tests/host/can_host_tests.cpp).
+//
+// Intended sole consumer is a control-side CAN writer (e.g. chassis runtime)
+// that needs transmit and health-check to be one decision. Until such a caller
+// exists, treat this entry point as unstable: do not build new APIs on top of
+// it, and re-evaluate whether it should stay in the shared contract when CAN is
+// first integrated into a product application. Plain transmit() plus snapshot()
+// covers every present use.
 types::status transmit_if_healthy(
     bus bus, std::uint32_t id, const std::uint8_t* data,
     std::uint16_t len, std::uint32_t expected_error_count,
