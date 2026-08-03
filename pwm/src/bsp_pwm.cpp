@@ -1,34 +1,83 @@
 #include "bsp_pwm.hpp"
 
+// TIM1 的 attended PWM 驗證閉包：CH1/CH2/CH3/CH4 → PE9/PE11/PE13/PE14。
+// 四路共用同一 ARR（20ms / 50Hz）給同類舵機；MyCar 底盤不使用它作為馬達控制介面。
+// 手寫 HAL 初始化，不經 CubeMX；IOC 未占用 TIM1 與這四個腳位。
+
 #include "pwm_channels.hpp"
 #include "stm32f4xx_hal.h"
 
 #include <array>
 #include <cmath>
+#include <cstddef>
 
 namespace bsp::pwm
 {
 namespace
 {
 
+struct channel_binding
+{
+    channel logical;
+    std::uint32_t timer_channel;
+    std::uint16_t gpio_pin;
+};
+
+// 邏輯通道 → TIM1 硬體通道 / GPIOE 腳位。
+constexpr std::array<channel_binding, board::pwm::servo_channel_count>
+    bindings{{
+        {board::pwm::servo_c2, TIM_CHANNEL_2, GPIO_PIN_11},
+        {board::pwm::servo_pe9, TIM_CHANNEL_1, GPIO_PIN_9},
+        {board::pwm::servo_pe13, TIM_CHANNEL_3, GPIO_PIN_13},
+        {board::pwm::servo_pe14, TIM_CHANNEL_4, GPIO_PIN_14},
+    }};
+
+constexpr std::uint32_t default_period_us = 20000U;
+
 TIM_HandleTypeDef timer{};
 bool initialized = false;
-constexpr std::uint32_t timer_channel = TIM_CHANNEL_2;
-constexpr std::size_t tracked_channel_count = 8U;
-std::array<std::uint32_t, tracked_channel_count> periods_us{
-    20000U, 20000U, 20000U, 20000U,
-    20000U, 20000U, 20000U, 20000U};
 
-bool selected_channel(channel selected) noexcept
+// 週期由共用時基決定；started 是每通道獨立的 capture/compare 輸出狀態。
+std::uint32_t shared_period_us = default_period_us;
+std::array<bool, board::pwm::servo_channel_count> channel_started{};
+
+const channel_binding* binding_of(channel selected) noexcept
 {
-    return selected == board::pwm::servo_c2;
+    for (const channel_binding& candidate : bindings)
+    {
+        if (candidate.logical == selected)
+        {
+            return &candidate;
+        }
+    }
+    return nullptr;
 }
 
-std::uint32_t* period_of(channel selected) noexcept
+std::size_t index_of(const channel_binding& binding) noexcept
 {
-    return selected.value < periods_us.size()
-               ? &periods_us[selected.value]
-               : nullptr;
+    return static_cast<std::size_t>(&binding - bindings.data());
+}
+
+std::uint16_t all_pins() noexcept
+{
+    std::uint16_t pins = 0U;
+    for (const channel_binding& candidate : bindings)
+    {
+        pins = static_cast<std::uint16_t>(pins | candidate.gpio_pin);
+    }
+    return pins;
+}
+
+bool any_channel_started() noexcept
+{
+    for (const bool started : channel_started)
+    {
+        if (started)
+        {
+            return true;
+        }
+    }
+    return false;
 }
 
 std::uint32_t timer_clock_hz() noexcept
@@ -56,7 +105,7 @@ types::status ensure_initialized() noexcept
     __HAL_RCC_TIM1_CLK_ENABLE();
 
     GPIO_InitTypeDef gpio{};
-    gpio.Pin = GPIO_PIN_11;
+    gpio.Pin = all_pins();
     gpio.Mode = GPIO_MODE_AF_PP;
     gpio.Pull = GPIO_NOPULL;
     gpio.Speed = GPIO_SPEED_FREQ_LOW;
@@ -66,7 +115,7 @@ types::status ensure_initialized() noexcept
     timer.Instance = TIM1;
     timer.Init.Prescaler = (clock_hz / 1000000U) - 1U;
     timer.Init.CounterMode = TIM_COUNTERMODE_UP;
-    timer.Init.Period = 20000U - 1U;
+    timer.Init.Period = shared_period_us - 1U;
     timer.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
     timer.Init.RepetitionCounter = 0U;
     timer.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
@@ -75,17 +124,22 @@ types::status ensure_initialized() noexcept
         return types::status::error;
     }
 
-    TIM_OC_InitTypeDef output{};
-    output.OCMode = TIM_OCMODE_PWM1;
-    output.Pulse = 0U;
-    output.OCPolarity = TIM_OCPOLARITY_HIGH;
-    output.OCNPolarity = TIM_OCNPOLARITY_HIGH;
-    output.OCFastMode = TIM_OCFAST_DISABLE;
-    output.OCIdleState = TIM_OCIDLESTATE_RESET;
-    output.OCNIdleState = TIM_OCNIDLESTATE_RESET;
-    if (HAL_TIM_PWM_ConfigChannel(&timer, &output, timer_channel) != HAL_OK)
+    // 全部通道以零脈寬配置，維持上電零輸出。
+    for (const channel_binding& candidate : bindings)
     {
-        return types::status::error;
+        TIM_OC_InitTypeDef output{};
+        output.OCMode = TIM_OCMODE_PWM1;
+        output.Pulse = 0U;
+        output.OCPolarity = TIM_OCPOLARITY_HIGH;
+        output.OCNPolarity = TIM_OCNPOLARITY_HIGH;
+        output.OCFastMode = TIM_OCFAST_DISABLE;
+        output.OCIdleState = TIM_OCIDLESTATE_RESET;
+        output.OCNIdleState = TIM_OCNIDLESTATE_RESET;
+        if (HAL_TIM_PWM_ConfigChannel(
+                &timer, &output, candidate.timer_channel) != HAL_OK)
+        {
+            return types::status::error;
+        }
     }
 
     initialized = true;
@@ -96,12 +150,13 @@ types::status ensure_initialized() noexcept
 
 bool is_enabled(channel selected) noexcept
 {
-    return selected_channel(selected);
+    return binding_of(selected) != nullptr;
 }
 
 types::status start(channel selected) noexcept
 {
-    if (!is_enabled(selected))
+    const channel_binding* binding = binding_of(selected);
+    if (binding == nullptr)
     {
         return types::status::not_configured;
     }
@@ -109,14 +164,18 @@ types::status start(channel selected) noexcept
     {
         return types::status::error;
     }
-    return HAL_TIM_PWM_Start(&timer, timer_channel) == HAL_OK
-               ? types::status::ok
-               : types::status::error;
+    if (HAL_TIM_PWM_Start(&timer, binding->timer_channel) != HAL_OK)
+    {
+        return types::status::error;
+    }
+    channel_started[index_of(*binding)] = true;
+    return types::status::ok;
 }
 
 types::status stop(channel selected) noexcept
 {
-    if (!is_enabled(selected))
+    const channel_binding* binding = binding_of(selected);
+    if (binding == nullptr)
     {
         return types::status::not_configured;
     }
@@ -125,13 +184,20 @@ types::status stop(channel selected) noexcept
         return types::status::ok;
     }
 
-    __HAL_TIM_SET_COMPARE(&timer, timer_channel, 0U);
+    __HAL_TIM_SET_COMPARE(&timer, binding->timer_channel, 0U);
     const HAL_StatusTypeDef result =
-        HAL_TIM_PWM_Stop(&timer, timer_channel);
-    (void)HAL_TIM_PWM_DeInit(&timer);
-    HAL_GPIO_DeInit(GPIOE, GPIO_PIN_11);
-    __HAL_RCC_TIM1_CLK_DISABLE();
-    initialized = false;
+        HAL_TIM_PWM_Stop(&timer, binding->timer_channel);
+    channel_started[index_of(*binding)] = false;
+
+    // 共用時基：只有最後一路停止時才釋放 TIM1 與腳位。
+    if (!any_channel_started())
+    {
+        (void)HAL_TIM_PWM_DeInit(&timer);
+        HAL_GPIO_DeInit(GPIOE, all_pins());
+        __HAL_RCC_TIM1_CLK_DISABLE();
+        initialized = false;
+        shared_period_us = default_period_us;
+    }
     return result == HAL_OK ? types::status::ok
                             : types::status::error;
 }
@@ -139,12 +205,11 @@ types::status stop(channel selected) noexcept
 types::status set_period_us(channel selected,
                             std::uint32_t period_us) noexcept
 {
-    std::uint32_t* current = period_of(selected);
     if (!is_enabled(selected))
     {
         return types::status::not_configured;
     }
-    if (current == nullptr || period_us == 0U || period_us > 65536U)
+    if (period_us == 0U || period_us > 65536U)
     {
         return types::status::invalid_arg;
     }
@@ -153,21 +218,33 @@ types::status set_period_us(channel selected,
         return types::status::error;
     }
 
+    // Fail closed: shortening ARR must not leave any existing CCR above the
+    // new period, which would otherwise make that PWM output continuously
+    // active in PWM mode 1.
+    for (const channel_binding& candidate : bindings)
+    {
+        if (__HAL_TIM_GET_COMPARE(&timer, candidate.timer_channel) > period_us)
+        {
+            return types::status::invalid_arg;
+        }
+    }
+
+    // ARR 是 timer 層級資源：改一路的週期會套用到全部四路。
     __HAL_TIM_SET_AUTORELOAD(&timer, period_us - 1U);
     __HAL_TIM_SET_COUNTER(&timer, 0U);
-    *current = period_us;
+    shared_period_us = period_us;
     return types::status::ok;
 }
 
 types::status set_pulse_us(channel selected,
                            std::uint32_t pulse_us) noexcept
 {
-    std::uint32_t* current = period_of(selected);
-    if (!is_enabled(selected))
+    const channel_binding* binding = binding_of(selected);
+    if (binding == nullptr)
     {
         return types::status::not_configured;
     }
-    if (current == nullptr || pulse_us > *current)
+    if (pulse_us > shared_period_us)
     {
         return types::status::invalid_arg;
     }
@@ -176,18 +253,17 @@ types::status set_pulse_us(channel selected,
         return types::status::error;
     }
 
-    __HAL_TIM_SET_COMPARE(&timer, timer_channel, pulse_us);
+    __HAL_TIM_SET_COMPARE(&timer, binding->timer_channel, pulse_us);
     return types::status::ok;
 }
 
 types::status set_duty(channel selected, float duty_ratio) noexcept
 {
-    std::uint32_t* current = period_of(selected);
     if (!is_enabled(selected))
     {
         return types::status::not_configured;
     }
-    if (current == nullptr || !std::isfinite(duty_ratio))
+    if (!std::isfinite(duty_ratio))
     {
         return types::status::invalid_arg;
     }
@@ -202,7 +278,7 @@ types::status set_duty(channel selected, float duty_ratio) noexcept
     return set_pulse_us(
         selected,
         static_cast<std::uint32_t>(
-            duty_ratio * static_cast<float>(*current)));
+            duty_ratio * static_cast<float>(shared_period_us)));
 }
 
 void set_period(channel selected, float period_s) noexcept
