@@ -438,6 +438,31 @@ types::status init(bus bus, bus_type type)
     return types::status::ok;
 }
 
+types::status restart(bus bus)
+{
+    const std::size_t idx = static_cast<std::size_t>(bus);
+    if (idx >= bus_count || !bus_enabled(idx) || !initialized[idx])
+    {
+        return types::status::error;
+    }
+
+    FDCAN_HandleTypeDef* handle = handle_of(bus);
+    if (handle == nullptr)
+    {
+        return types::status::error;
+    }
+
+    if (HAL_FDCAN_Stop(handle) != HAL_OK)
+    {
+        return types::status::error;
+    }
+    if (HAL_FDCAN_Start(handle) != HAL_OK)
+    {
+        return types::status::error;
+    }
+    return types::status::ok;
+}
+
 types::status transmit(bus bus, uint32_t id, const uint8_t* data, uint16_t len)
 {
     if (data == nullptr || len == 0)
