@@ -1,7 +1,5 @@
 #include "bsp_adc.hpp"
 
-#include "bsp_adc_detail.hpp"
-
 namespace bsp::adc
 {
 namespace

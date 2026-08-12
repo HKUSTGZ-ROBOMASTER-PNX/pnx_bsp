@@ -1,7 +1,5 @@
 #include "bsp_pwm.hpp"
 
-#include "bsp_pwm_detail.hpp"
-
 #include <cmath>
 #include <cstdint>
 #include <limits>
