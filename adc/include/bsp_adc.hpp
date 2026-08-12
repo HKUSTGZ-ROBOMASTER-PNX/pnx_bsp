@@ -8,7 +8,7 @@
 namespace bsp::adc
 {
 
-constexpr bool is_configured(channel channel_id)
+constexpr bool is_enabled(channel channel_id)
 {
     return static_cast<std::size_t>(channel_id) < channel_count;
 }

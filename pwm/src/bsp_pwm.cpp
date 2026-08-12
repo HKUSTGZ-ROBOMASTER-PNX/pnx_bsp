@@ -28,7 +28,7 @@ const channel_config* config_of(channel channel_id) noexcept
 
 types::status get_binding(channel channel_id, detail::binding& binding) noexcept
 {
-    if (!is_configured(channel_id))
+    if (!is_enabled(channel_id))
     {
         return types::status::invalid_arg;
     }
