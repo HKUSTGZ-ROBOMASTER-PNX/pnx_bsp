@@ -7,24 +7,31 @@
 namespace bsp::pwm
 {
 
-enum class channel : uint8_t
+constexpr bool is_enabled(channel channel_id)
 {
-    tim3_ch4 = 0,
-    tim12_ch2 = 1,
-};
-
-constexpr bool is_enabled(channel ch)
-{
-    const auto index = static_cast<std::size_t>(ch);
-    return index < channel_count && configs[index].enabled;
+    return static_cast<std::size_t>(channel_id) < channel_count;
 }
 
-TIM_HandleTypeDef* timer_of(channel ch) noexcept;
-std::uint32_t hal_channel_of(channel ch) noexcept;
+types::status init(channel channel_id);
+types::status start(channel channel_id);
+types::status stop(channel channel_id);
+types::status set_duty(channel channel_id, float duty_ratio);
 
-types::status start(channel ch);
-types::status stop(channel ch);
-void set_duty(channel ch, float duty_ratio);
-void set_period(channel ch, float period_s);
+// The period belongs to the timer and therefore affects every channel on it.
+types::status set_period_us(channel channel_id, std::uint32_t period_us);
+types::status set_pulse_width_us(channel channel_id, std::uint32_t pulse_width_us);
 
 } // namespace bsp::pwm
+
+namespace bsp::pwm::detail
+{
+
+struct binding
+{
+    TIM_HandleTypeDef* timer = nullptr;
+    std::uint32_t hal_channel = 0;
+};
+
+bool binding_for(channel channel_id, binding& out) noexcept;
+
+} // namespace bsp::pwm::detail

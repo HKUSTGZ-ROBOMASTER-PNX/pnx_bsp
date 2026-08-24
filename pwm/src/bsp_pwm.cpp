@@ -1,163 +1,173 @@
 #include "bsp_pwm.hpp"
 
-namespace
-{
-
-struct pwm_binding
-{
-    TIM_HandleTypeDef* timer = nullptr;
-    uint32_t hal_channel = 0;
-};
-
-bool binding_for(bsp::pwm::channel ch, pwm_binding* out)
-{
-    if (out == nullptr)
-    {
-        return false;
-    }
-
-    if (!bsp::pwm::is_enabled(ch))
-    {
-        return false;
-    }
-
-    out->timer = bsp::pwm::timer_of(ch);
-    out->hal_channel = bsp::pwm::hal_channel_of(ch);
-    return out->timer != nullptr && out->hal_channel != 0U;
-}
-
-} // namespace
+#include <cmath>
+#include <cstdint>
+#include <limits>
 
 namespace bsp::pwm
 {
-
 namespace
 {
 
-const channel_config* config_of(channel ch) noexcept
+constexpr std::uint64_t compare_for_duty(std::uint64_t period_ticks, float duty_ratio) noexcept
 {
-    const auto index = static_cast<std::size_t>(ch);
+    return static_cast<std::uint64_t>(duty_ratio * static_cast<double>(period_ticks));
+}
+
+static_assert(compare_for_duty(2'000U, 0.0f) == 0U);
+static_assert(compare_for_duty(2'000U, 0.5f) == 1'000U);
+static_assert(compare_for_duty(2'000U, 1.0f) == 2'000U);
+
+const channel_config* config_of(channel channel_id) noexcept
+{
+    const auto index = static_cast<std::size_t>(channel_id);
     return index < channel_count ? &configs[index] : nullptr;
 }
 
-TIM_HandleTypeDef* timer_from_id(timer_id id) noexcept
+types::status get_binding(channel channel_id, detail::binding& binding) noexcept
 {
-    switch (id)
+    if (!is_enabled(channel_id))
     {
-    case timer_id::tim3:
-        return &htim3;
-    case timer_id::tim12:
-        return &htim12;
-    default:
-        return nullptr;
+        return types::status::invalid_arg;
     }
+    if (!detail::binding_for(channel_id, binding) || binding.timer == nullptr || binding.hal_channel == 0U)
+    {
+        return types::status::not_configured;
+    }
+    return types::status::ok;
 }
 
-std::uint32_t hal_channel_from_id(channel_id id) noexcept
+bool timer_ticks_for_us(const channel_config& config,
+                        const TIM_HandleTypeDef& timer,
+                        std::uint32_t duration_us,
+                        std::uint64_t& ticks) noexcept
 {
-    switch (id)
+    const std::uint64_t divider = static_cast<std::uint64_t>(timer.Init.Prescaler) + 1U;
+    if (config.timer_clock_hz == 0U || divider == 0U)
     {
-    case channel_id::ch1:
-        return TIM_CHANNEL_1;
-    case channel_id::ch2:
-        return TIM_CHANNEL_2;
-    case channel_id::ch3:
-        return TIM_CHANNEL_3;
-    case channel_id::ch4:
-        return TIM_CHANNEL_4;
-    default:
-        return 0;
+        return false;
     }
+    const std::uint64_t timer_tick_hz = static_cast<std::uint64_t>(config.timer_clock_hz) / divider;
+    if (timer_tick_hz == 0U || duration_us > std::numeric_limits<std::uint64_t>::max() / timer_tick_hz)
+    {
+        return false;
+    }
+    ticks = timer_tick_hz * duration_us / 1'000'000U;
+    return ticks != 0U || duration_us == 0U;
 }
 
 } // namespace
 
-TIM_HandleTypeDef* timer_of(channel ch) noexcept
+types::status init(channel channel_id)
 {
-    const channel_config* cfg = config_of(ch);
-    return cfg != nullptr && cfg->enabled ? timer_from_id(cfg->timer) : nullptr;
-}
-
-std::uint32_t hal_channel_of(channel ch) noexcept
-{
-    const channel_config* cfg = config_of(ch);
-    return cfg != nullptr && cfg->enabled ? hal_channel_from_id(cfg->channel) : 0;
-}
-
-types::status start(channel ch)
-{
-    pwm_binding binding{};
-    if (!binding_for(ch, &binding))
+    detail::binding binding{};
+    const types::status status = get_binding(channel_id, binding);
+    const channel_config* config = config_of(channel_id);
+    if (status != types::status::ok || config == nullptr || config->timer_clock_hz == 0U)
     {
-        return is_enabled(ch) ? types::status::invalid_arg : types::status::not_configured;
+        return status == types::status::ok ? types::status::not_configured : status;
     }
-
-    __HAL_TIM_SET_COMPARE(binding.timer, binding.hal_channel, 0);
-    if (HAL_TIM_PWM_Start(binding.timer, binding.hal_channel) != HAL_OK)
-    {
-        return types::status::error;
-    }
-
     return types::status::ok;
 }
 
-types::status stop(channel ch)
+types::status start(channel channel_id)
 {
-    pwm_binding binding{};
-    if (!binding_for(ch, &binding))
+    detail::binding binding{};
+    const types::status status = get_binding(channel_id, binding);
+    if (status != types::status::ok)
     {
-        return is_enabled(ch) ? types::status::invalid_arg : types::status::not_configured;
+        return status;
     }
+    return HAL_TIM_PWM_Start(binding.timer, binding.hal_channel) == HAL_OK
+               ? types::status::ok
+               : types::status::error;
+}
 
-    if (HAL_TIM_PWM_Stop(binding.timer, binding.hal_channel) != HAL_OK)
+types::status stop(channel channel_id)
+{
+    detail::binding binding{};
+    const types::status status = get_binding(channel_id, binding);
+    if (status != types::status::ok)
     {
-        return types::status::error;
+        return status;
     }
+    return HAL_TIM_PWM_Stop(binding.timer, binding.hal_channel) == HAL_OK
+               ? types::status::ok
+               : types::status::error;
+}
 
+types::status set_duty(channel channel_id, float duty_ratio)
+{
+    detail::binding binding{};
+    const types::status status = get_binding(channel_id, binding);
+    if (status != types::status::ok)
+    {
+        return status;
+    }
+    if (!std::isfinite(duty_ratio) || duty_ratio < 0.0f || duty_ratio > 1.0f)
+    {
+        return types::status::invalid_arg;
+    }
+    const std::uint64_t period_ticks = static_cast<std::uint64_t>(__HAL_TIM_GET_AUTORELOAD(binding.timer)) + 1U;
+    const std::uint64_t compare = compare_for_duty(period_ticks, duty_ratio);
+    if (compare > std::numeric_limits<std::uint32_t>::max())
+    {
+        return types::status::invalid_arg;
+    }
+    __HAL_TIM_SET_COMPARE(binding.timer, binding.hal_channel, static_cast<std::uint32_t>(compare));
     return types::status::ok;
 }
 
-void set_period(channel ch, float period_s)
+types::status set_period_us(channel channel_id, std::uint32_t period_us)
 {
-    pwm_binding binding{};
-    if (!binding_for(ch, &binding) || period_s <= 0.0f)
+    detail::binding binding{};
+    const types::status status = get_binding(channel_id, binding);
+    const channel_config* config = config_of(channel_id);
+    if (status != types::status::ok || config == nullptr)
     {
-        return;
+        return status == types::status::ok ? types::status::not_configured : status;
     }
-
-    const uint32_t prescaler = binding.timer->Init.Prescaler + 1U;
-    const channel_config* cfg = config_of(ch);
-    const uint32_t source_clock_hz = cfg != nullptr ? cfg->timer_clock_hz : 0U;
-    if (source_clock_hz == 0U)
+    if (period_us == 0U)
     {
-        return;
+        return types::status::invalid_arg;
     }
-
-    __HAL_TIM_SET_AUTORELOAD(
-        binding.timer,
-        static_cast<uint32_t>(period_s * (static_cast<float>(source_clock_hz) / static_cast<float>(prescaler))));
+    std::uint64_t period_ticks = 0U;
+    if (!timer_ticks_for_us(*config, *binding.timer, period_us, period_ticks))
+    {
+        return types::status::invalid_arg;
+    }
+    const std::uint64_t max_period_ticks = IS_TIM_32B_COUNTER_INSTANCE(binding.timer->Instance)
+                                               ? 0x1'0000'0000ULL
+                                               : 0x1'0000ULL;
+    if (period_ticks == 0U || period_ticks > max_period_ticks)
+    {
+        return types::status::invalid_arg;
+    }
+    __HAL_TIM_SET_AUTORELOAD(binding.timer, static_cast<std::uint32_t>(period_ticks - 1U));
+    return types::status::ok;
 }
 
-void set_duty(channel ch, float duty_ratio)
+types::status set_pulse_width_us(channel channel_id, std::uint32_t pulse_width_us)
 {
-    pwm_binding binding{};
-    if (!binding_for(ch, &binding))
+    detail::binding binding{};
+    const types::status status = get_binding(channel_id, binding);
+    const channel_config* config = config_of(channel_id);
+    if (status != types::status::ok || config == nullptr)
     {
-        return;
+        return status == types::status::ok ? types::status::not_configured : status;
     }
-
-    if (duty_ratio < 0.0f)
+    std::uint64_t pulse_ticks = 0U;
+    if (!timer_ticks_for_us(*config, *binding.timer, pulse_width_us, pulse_ticks))
     {
-        duty_ratio = 0.0f;
+        return types::status::invalid_arg;
     }
-    if (duty_ratio > 1.0f)
+    const std::uint64_t period_ticks = static_cast<std::uint64_t>(__HAL_TIM_GET_AUTORELOAD(binding.timer)) + 1U;
+    if (pulse_ticks > period_ticks)
     {
-        duty_ratio = 1.0f;
+        return types::status::invalid_arg;
     }
-
-    const uint32_t period = __HAL_TIM_GET_AUTORELOAD(binding.timer) + 1U;
-    __HAL_TIM_SET_COMPARE(binding.timer, binding.hal_channel,
-                          static_cast<uint32_t>(duty_ratio * static_cast<float>(period)));
+    __HAL_TIM_SET_COMPARE(binding.timer, binding.hal_channel, static_cast<std::uint32_t>(pulse_ticks));
+    return types::status::ok;
 }
 
 } // namespace bsp::pwm
