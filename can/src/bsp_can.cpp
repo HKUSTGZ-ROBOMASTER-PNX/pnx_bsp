@@ -241,11 +241,11 @@ types::status init_fd(bus bus)
     {
         return types::status::error;
     }
-    if (HAL_FDCAN_EnableTxDelayCompensation(&hfdcan1) != HAL_OK)
+    if (HAL_FDCAN_EnableTxDelayCompensation(handle) != HAL_OK)
     {
         return types::status::error;
     }
-    if (HAL_FDCAN_ConfigTxDelayCompensation(&hfdcan1,13,13) != HAL_OK)
+    if (HAL_FDCAN_ConfigTxDelayCompensation(handle,13,13) != HAL_OK)
     {
         return types::status::error;
     }
