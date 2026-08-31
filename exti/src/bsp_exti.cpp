@@ -1,3 +1,4 @@
+#include "bsp_exti.hpp"
 #include "bsp_exti.h"
 
 namespace
@@ -6,8 +7,7 @@ namespace
 struct exti_slot
 {
     uint16_t pin = 0;
-    bsp_exti_callback_t callback = nullptr;
-    void* user = nullptr;
+    bsp::exti::interrupt_callback callback{};
 };
 
 constexpr int max_exti_slots = 16;
@@ -15,27 +15,31 @@ exti_slot slots[max_exti_slots]{};
 
 } // namespace
 
-extern "C" void bsp_exti_attach(uint16_t pin, bsp_exti_callback_t callback, void* user)
+types::status bsp::exti::attach(uint16_t pin, interrupt_callback callback)
 {
+    if (!callback)
+    {
+        return types::status::invalid_arg;
+    }
     for (auto& slot : slots)
     {
         if (slot.pin == pin || slot.pin == 0)
         {
             slot.pin = pin;
             slot.callback = callback;
-            slot.user = user;
-            return;
+            return types::status::ok;
         }
     }
+    return types::status::error;
 }
 
 extern "C" void bsp_exti_dispatch(uint16_t pin)
 {
     for (auto& slot : slots)
     {
-        if (slot.pin == pin && slot.callback != nullptr)
+        if (slot.pin == pin && slot.callback)
         {
-            slot.callback(slot.user);
+            slot.callback();
             return;
         }
     }

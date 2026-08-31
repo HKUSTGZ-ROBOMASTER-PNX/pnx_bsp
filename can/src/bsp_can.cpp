@@ -74,8 +74,7 @@ namespace
 
 struct rx_slot
 {
-    rx_handler handler = nullptr;
-    void* user_data = nullptr;
+    rx_callback callback{};
 };
 
 std::array<bus_type, bus_count> active_types{};
@@ -151,9 +150,9 @@ void notify_rx(bus bus, const rx_frame& frame)
     }
     for (auto& slot : rx_slots[idx])
     {
-        if (slot.handler != nullptr)
+        if (slot.callback)
         {
-            slot.handler(bus, frame, slot.user_data);
+            slot.callback(bus, frame);
         }
     }
 }
@@ -494,9 +493,9 @@ types::status transmit(bus bus, uint32_t id, const uint8_t* data, uint16_t len)
     return transmit_fd(bus, id, data, len);
 }
 
-types::status register_rx_handler(bus bus, rx_handler handler, void* user_data)
+types::status register_rx_callback(bus bus, rx_callback callback)
 {
-    if (handler == nullptr)
+    if (!callback)
     {
         return types::status::invalid_arg;
     }
@@ -514,10 +513,9 @@ types::status register_rx_handler(bus bus, rx_handler handler, void* user_data)
 
     for (auto& slot : rx_slots[idx])
     {
-        if (slot.handler == nullptr)
+        if (!slot.callback)
         {
-            slot.handler = handler;
-            slot.user_data = user_data;
+            slot.callback = callback;
             return types::status::ok;
         }
     }
@@ -525,7 +523,7 @@ types::status register_rx_handler(bus bus, rx_handler handler, void* user_data)
     return types::status::error;
 }
 
-void unregister_rx_handlers(bus bus)
+void unregister_rx_callbacks(bus bus)
 {
     const std::size_t idx = static_cast<std::size_t>(bus);
     if (idx >= bus_count)
@@ -540,8 +538,7 @@ void unregister_rx_handlers(bus bus)
 
     for (auto& slot : rx_slots[idx])
     {
-        slot.handler = nullptr;
-        slot.user_data = nullptr;
+        slot.callback = {};
     }
 }
 

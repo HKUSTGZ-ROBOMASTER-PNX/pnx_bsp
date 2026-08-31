@@ -2,6 +2,7 @@
 
 #include "bridge_usb.h"
 #include "memory.h"
+#include "stm32h7xx.h"
 
 #include "ux_api.h"
 #include "ux_device_class_cdc_acm.h"
@@ -10,22 +11,23 @@
 
 namespace bsp::usb
 {
-
 namespace
 {
 
-constexpr uint16_t k_io_buffer_size = 512;
-constexpr uint16_t k_read_stack_size = 1536;
-constexpr uint16_t k_write_stack_size = 1536;
+constexpr uint16_t k_io_buffer_size = 512U;
+constexpr uint16_t k_read_stack_size = 1536U;
+constexpr uint16_t k_write_stack_size = 1536U;
 
 alignas(8) uint8_t read_stack[k_read_stack_size] RAM_D1_BSS{};
 alignas(8) uint8_t write_stack[k_write_stack_size] RAM_D1_BSS{};
 alignas(4) uint8_t rx_buffer[k_io_buffer_size] RAM_D1_BSS{};
-alignas(4) uint8_t tx_buffer[k_io_buffer_size] RAM_D1_BSS{};
+alignas(4) uint8_t in_flight_buffer[k_io_buffer_size] RAM_D1_BSS{};
+alignas(4) uint8_t pending_buffer[k_io_buffer_size] RAM_D1_BSS{};
 
 TX_THREAD read_thread RAM_D1_BSS{};
 TX_THREAD write_thread RAM_D1_BSS{};
 TX_SEMAPHORE write_signal RAM_D1_BSS{};
+TX_MUTEX tx_lock RAM_D1_BSS{};
 
 config cdc_config{};
 runtime_state usb_state{};
@@ -48,6 +50,53 @@ void refresh_connection()
     usb_state.connected = device_ready();
 }
 
+bool dequeue_pending(uint16_t& len)
+{
+    if (tx_mutex_get(&tx_lock, TX_WAIT_FOREVER) != TX_SUCCESS)
+    {
+        return false;
+    }
+    if (!usb_state.pending_write)
+    {
+        tx_mutex_put(&tx_lock);
+        return false;
+    }
+
+    len = usb_state.pending_write_len;
+    std::memcpy(in_flight_buffer, pending_buffer, len);
+    usb_state.pending_write = false;
+    usb_state.pending_write_len = 0U;
+    usb_state.in_flight_write = true;
+    tx_mutex_put(&tx_lock);
+    return true;
+}
+
+void report_tx_result(const tx_result& result)
+{
+    if (tx_mutex_get(&tx_lock, TX_WAIT_FOREVER) == TX_SUCCESS)
+    {
+        usb_state.in_flight_write = false;
+        usb_state.last_write_requested = result.requested_len;
+        usb_state.last_write_actual = result.actual_len;
+        usb_state.last_write_status = result.usb_status;
+        usb_state.last_tx_result = result;
+        if (result.success())
+        {
+            ++usb_state.write_count;
+        }
+        else
+        {
+            ++usb_state.error_count;
+        }
+        tx_mutex_put(&tx_lock);
+    }
+
+    if (cdc_config.on_tx_result)
+    {
+        cdc_config.on_tx_result(result);
+    }
+}
+
 void read_thread_entry(ULONG thread_input)
 {
     (void)thread_input;
@@ -55,9 +104,9 @@ void read_thread_entry(ULONG thread_input)
     while (true)
     {
         refresh_connection();
-        if (usb_state.connected && cdc_config.on_rx != nullptr)
+        if (usb_state.connected && cdc_config.on_rx)
         {
-            ULONG actual_length = 0;
+            ULONG actual_length = 0U;
             UX_SLAVE_CLASS_CDC_ACM* cdc = usb_cdc_handle();
             usb_state.read_busy = true;
             const UINT status = ux_device_class_cdc_acm_read(
@@ -66,11 +115,10 @@ void read_thread_entry(ULONG thread_input)
             usb_state.last_read_status = status;
             usb_state.last_read_len = static_cast<uint16_t>(actual_length);
 
-            if (status == UX_SUCCESS && actual_length >= cdc_config.min_rx_size)
+            if (status == UX_SUCCESS && actual_length > 0U)
             {
                 ++usb_state.read_count;
-                cdc_config.on_rx(rx_buffer, static_cast<uint16_t>(actual_length), cdc_config.user);
-                tx_semaphore_put(&write_signal);
+                cdc_config.on_rx(rx_buffer, static_cast<uint16_t>(actual_length));
             }
             else if (status != UX_SUCCESS)
             {
@@ -86,52 +134,44 @@ void write_thread_entry(ULONG thread_input)
 {
     (void)thread_input;
 
-    tx_thread_sleep(10);
-
     while (true)
     {
-        refresh_connection();
-        if (!usb_state.connected || cdc_config.fill_tx == nullptr)
+        if (tx_semaphore_get(&write_signal, TX_WAIT_FOREVER) != TX_SUCCESS)
         {
-            tx_thread_sleep(cdc_config.period_ticks);
+            continue;
+        }
+        ++usb_state.tx_wake_count;
+
+        uint16_t requested_len = 0U;
+        if (!dequeue_pending(requested_len))
+        {
             continue;
         }
 
-        if (tx_semaphore_get(&write_signal, cdc_config.period_ticks) == TX_SUCCESS)
+        tx_result result{};
+        result.requested_len = requested_len;
+        refresh_connection();
+        if (!usb_state.connected)
         {
-            ++usb_state.tx_wake_count;
+            result.code = tx_result_code::not_connected;
+            result.usb_status = UX_ERROR;
+            report_tx_result(result);
+            continue;
         }
 
-        ++usb_state.fill_count;
-        const uint16_t tx_len = cdc_config.fill_tx(tx_buffer, cdc_config.max_tx_size, cdc_config.user);
-        usb_state.pending_write_len = tx_len;
-        if (tx_len > 0)
-        {
-            ULONG actual_length = 0;
-            UX_SLAVE_CLASS_CDC_ACM* cdc = usb_cdc_handle();
-            usb_state.write_busy = true;
-            usb_state.last_write_requested = tx_len;
-            const UINT status = ux_device_class_cdc_acm_write(
-                cdc, tx_buffer, static_cast<ULONG>(tx_len), &actual_length);
-            usb_state.write_busy = false;
-            usb_state.pending_write_len = 0;
-            usb_state.last_write_status = status;
-            usb_state.last_write_actual = static_cast<uint16_t>(actual_length);
-            if (status == UX_SUCCESS && actual_length == tx_len)
-            {
-                ++usb_state.write_count;
-            }
-            else
-            {
-                ++usb_state.error_count;
-            }
+        ULONG actual_length = 0U;
+        UX_SLAVE_CLASS_CDC_ACM* cdc = usb_cdc_handle();
+        usb_state.write_busy = true;
+        const UINT status = ux_device_class_cdc_acm_write(
+            cdc, in_flight_buffer, static_cast<ULONG>(requested_len), &actual_length);
+        usb_state.write_busy = false;
 
-            if (cdc_config.on_tx_done != nullptr)
-            {
-                cdc_config.on_tx_done(
-                    tx_len, static_cast<uint16_t>(actual_length), status, cdc_config.user);
-            }
-        }
+        result.actual_len = static_cast<uint16_t>(actual_length);
+        result.usb_status = status;
+        result.code = status != UX_SUCCESS ? tx_result_code::usb_error
+                      : actual_length != requested_len ? tx_result_code::short_write
+                                                       : tx_result_code::success;
+        report_tx_result(result);
     }
 }
 
@@ -143,35 +183,32 @@ types::status init(const config& cfg)
     {
         return types::status::ok;
     }
-
-    if (cfg.on_rx == nullptr && cfg.fill_tx == nullptr)
+    if (!cfg.on_rx && !cfg.on_tx_result)
     {
-        return types::status::error;
+        return types::status::invalid_arg;
     }
 
     cdc_config = cfg;
-    if (cdc_config.max_tx_size > k_io_buffer_size)
-    {
-        cdc_config.max_tx_size = k_io_buffer_size;
-    }
     if (cdc_config.write_priority > cdc_config.read_priority)
     {
         cdc_config.write_priority = cdc_config.read_priority;
     }
 
-    if (tx_semaphore_create(&write_signal, const_cast<CHAR*>("usb_cdc_tx_ready"), 0) != TX_SUCCESS)
+    if (tx_mutex_create(&tx_lock, const_cast<CHAR*>("usb_cdc_tx"), TX_NO_INHERIT) != TX_SUCCESS)
     {
         return types::status::error;
     }
-
-    if (tx_thread_create(&read_thread, const_cast<CHAR*>("usb_cdc_rx"), read_thread_entry, 0,
+    if (tx_semaphore_create(&write_signal, const_cast<CHAR*>("usb_cdc_tx_ready"), 0U) != TX_SUCCESS)
+    {
+        return types::status::error;
+    }
+    if (tx_thread_create(&read_thread, const_cast<CHAR*>("usb_cdc_rx"), read_thread_entry, 0U,
                          read_stack, sizeof(read_stack), cdc_config.read_priority, cdc_config.read_priority,
                          TX_NO_TIME_SLICE, TX_AUTO_START) != TX_SUCCESS)
     {
         return types::status::error;
     }
-
-    if (tx_thread_create(&write_thread, const_cast<CHAR*>("usb_cdc_tx"), write_thread_entry, 0,
+    if (tx_thread_create(&write_thread, const_cast<CHAR*>("usb_cdc_tx"), write_thread_entry, 0U,
                          write_stack, sizeof(write_stack), cdc_config.write_priority, cdc_config.write_priority,
                          TX_NO_TIME_SLICE, TX_AUTO_START) != TX_SUCCESS)
     {
@@ -192,6 +229,62 @@ const runtime_state& state()
 {
     refresh_connection();
     return usb_state;
+}
+
+types::status try_send(const uint8_t* data, std::size_t len)
+{
+    if (!initialized)
+    {
+        return types::status::not_initialized;
+    }
+    if (__get_IPSR() != 0U || tx_thread_identify() == TX_NULL)
+    {
+        return types::status::invalid_context;
+    }
+    if (len == 0U)
+    {
+        return types::status::empty;
+    }
+    if (len > k_io_buffer_size)
+    {
+        return types::status::too_large;
+    }
+    if (data == nullptr)
+    {
+        return types::status::invalid_arg;
+    }
+
+    refresh_connection();
+    if (!usb_state.connected)
+    {
+        return types::status::not_connected;
+    }
+    if (tx_mutex_get(&tx_lock, TX_NO_WAIT) != TX_SUCCESS)
+    {
+        return types::status::busy;
+    }
+    if (usb_state.pending_write)
+    {
+        tx_mutex_put(&tx_lock);
+        return types::status::busy;
+    }
+
+    std::memcpy(pending_buffer, data, len);
+    usb_state.pending_write_len = static_cast<uint16_t>(len);
+    usb_state.pending_write = true;
+    tx_mutex_put(&tx_lock);
+
+    if (tx_semaphore_put(&write_signal) != TX_SUCCESS)
+    {
+        if (tx_mutex_get(&tx_lock, TX_NO_WAIT) == TX_SUCCESS)
+        {
+            usb_state.pending_write = false;
+            usb_state.pending_write_len = 0U;
+            tx_mutex_put(&tx_lock);
+        }
+        return types::status::error;
+    }
+    return types::status::ok;
 }
 
 } // namespace bsp::usb

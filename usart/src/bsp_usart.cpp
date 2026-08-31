@@ -26,8 +26,7 @@ struct port_state
     bool initialized = false;
     bool tx_busy = false;
     bsp::usart::mode port_mode = bsp::usart::mode::block;
-    bsp::usart::rx_handler handler = nullptr;
-    void* user_data = nullptr;
+    bsp::usart::rx_callback callback{};
     TX_SEMAPHORE* notify_sem = nullptr;
     bsp::dma::buffer_view rx_buffer{};
     size_t rx_position = 0;
@@ -182,9 +181,9 @@ void notify_rx(bsp::usart::port port, uint8_t* data, size_t len)
     {
         tx_semaphore_put(ctx->notify_sem);
     }
-    if (ctx->handler != nullptr)
+    if (ctx->callback)
     {
-        ctx->handler(port, frame, ctx->user_data);
+        ctx->callback(port, frame);
     }
 }
 
@@ -202,12 +201,12 @@ void disable_rx_half_transfer_irq(UART_HandleTypeDef* handle)
     }
 }
 
-bool same_rx_owner(const port_state& ctx, bsp::dma::buffer_view buffer, bsp::usart::rx_handler handler,
-                   void* user_data, TX_SEMAPHORE* notify_sem)
+bool same_rx_owner(const port_state& ctx, bsp::dma::buffer_view buffer, bsp::usart::rx_callback callback,
+                   TX_SEMAPHORE* notify_sem)
 {
     return ctx.rx_buffer.data() == buffer.data() && ctx.rx_buffer.logical_size() == buffer.logical_size() &&
-           ctx.rx_buffer.capacity() == buffer.capacity() && ctx.handler == handler &&
-           ctx.user_data == user_data && ctx.notify_sem == notify_sem;
+           ctx.rx_buffer.capacity() == buffer.capacity() && ctx.callback == callback &&
+           ctx.notify_sem == notify_sem;
 }
 
 } // namespace
@@ -607,8 +606,8 @@ types::status transmit(port port, const uint8_t* data, size_t len, uint32_t time
     return types::status::ok;
 }
 
-types::status start_rx_to_idle(port port, bsp::dma::buffer_view buffer, rx_handler handler,
-                               void* user_data, TX_SEMAPHORE* notify_sem)
+types::status start_rx_to_idle(port port, bsp::dma::buffer_view buffer, rx_callback callback,
+                               TX_SEMAPHORE* notify_sem)
 {
     if (!bsp::dma::valid(buffer))
     {
@@ -633,7 +632,7 @@ types::status start_rx_to_idle(port port, bsp::dma::buffer_view buffer, rx_handl
     }
 
     if (ctx->rx_buffer.data() != nullptr &&
-        !same_rx_owner(*ctx, buffer, handler, user_data, notify_sem))
+        !same_rx_owner(*ctx, buffer, callback, notify_sem))
     {
         return types::status::busy;
     }
@@ -652,8 +651,7 @@ types::status start_rx_to_idle(port port, bsp::dma::buffer_view buffer, rx_handl
     disable_rx_half_transfer_irq(handle);
     ctx->rx_buffer = buffer;
     ctx->rx_position = 0;
-    ctx->handler = handler;
-    ctx->user_data = user_data;
+    ctx->callback = callback;
     ctx->notify_sem = notify_sem;
 
     return types::status::ok;
