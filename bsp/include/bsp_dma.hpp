@@ -31,6 +31,8 @@ private:
     std::size_t capacity_ = 0U;
 };
 
+bool valid(buffer_view buffer) noexcept;
+
 template <std::size_t LogicalSize>
 class buffer
 {

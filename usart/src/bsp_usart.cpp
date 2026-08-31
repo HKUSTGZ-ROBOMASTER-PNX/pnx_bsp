@@ -19,12 +19,6 @@ namespace
 {
 
 constexpr uint16_t dma_tx_stage_size = 256;
-constexpr std::uintptr_t ram_d1_start = 0x24000000UL;
-constexpr std::uintptr_t ram_d1_end = 0x24050000UL;
-constexpr std::uintptr_t ram_d2_start = 0x30000000UL;
-constexpr std::uintptr_t ram_d2_end = 0x30008000UL;
-constexpr std::uintptr_t ram_d3_start = 0x38000000UL;
-constexpr std::uintptr_t ram_d3_end = 0x38004000UL;
 constexpr std::uintptr_t dcache_line_size = 32U;
 
 struct port_state
@@ -70,30 +64,6 @@ std::uintptr_t align_down(std::uintptr_t value, std::uintptr_t alignment)
 std::uintptr_t align_up(std::uintptr_t value, std::uintptr_t alignment)
 {
     return (value + alignment - 1U) & ~(alignment - 1U);
-}
-
-bool in_range(std::uintptr_t addr, std::uintptr_t start, std::uintptr_t end)
-{
-    return addr >= start && addr < end;
-}
-
-bool is_dma_accessible_buffer(const void* buffer, size_t len)
-{
-    if (buffer == nullptr || len == 0)
-    {
-        return false;
-    }
-
-    const auto start = reinterpret_cast<std::uintptr_t>(buffer);
-    if (start > std::numeric_limits<std::uintptr_t>::max() - (len - 1U))
-    {
-        return false;
-    }
-    const auto last = start + len - 1U;
-
-    return (in_range(start, ram_d1_start, ram_d1_end) && in_range(last, ram_d1_start, ram_d1_end)) ||
-           (in_range(start, ram_d2_start, ram_d2_end) && in_range(last, ram_d2_start, ram_d2_end)) ||
-           (in_range(start, ram_d3_start, ram_d3_end) && in_range(last, ram_d3_start, ram_d3_end));
 }
 
 bool cache_range_in_owner(bsp::dma::buffer_view buffer, size_t offset, size_t len,
@@ -197,34 +167,6 @@ bool clean_tx_dma_buffer(bsp::dma::buffer_view buffer, size_t len)
     (void)len;
 #endif
     return true;
-}
-
-extern "C"
-{
-extern uint8_t _sdma_buffer;
-extern uint8_t _edma_buffer;
-}
-
-bool valid_rx_dma_buffer(bsp::dma::buffer_view buffer)
-{
-    if (buffer.data() == nullptr || buffer.logical_size() == 0U ||
-        buffer.logical_size() > buffer.capacity() ||
-        (reinterpret_cast<std::uintptr_t>(buffer.data()) % dcache_line_size) != 0U ||
-        (buffer.capacity() % dcache_line_size) != 0U ||
-        !is_dma_accessible_buffer(buffer.data(), buffer.capacity()))
-    {
-        return false;
-    }
-
-    const std::uintptr_t start = reinterpret_cast<std::uintptr_t>(buffer.data());
-    if (start > std::numeric_limits<std::uintptr_t>::max() - buffer.capacity())
-    {
-        return false;
-    }
-    const std::uintptr_t end = start + buffer.capacity();
-    const std::uintptr_t dma_start = reinterpret_cast<std::uintptr_t>(&_sdma_buffer);
-    const std::uintptr_t dma_end = reinterpret_cast<std::uintptr_t>(&_edma_buffer);
-    return dma_start <= start && start <= end && end <= dma_end;
 }
 
 void notify_rx(bsp::usart::port port, uint8_t* data, size_t len)
@@ -388,7 +330,7 @@ types::status restart_rx(port port)
 {
     port_state* ctx = state_of(port);
     UART_HandleTypeDef* handle = handle_of(port);
-    if (ctx == nullptr || handle == nullptr || !valid_rx_dma_buffer(ctx->rx_buffer))
+    if (ctx == nullptr || handle == nullptr || !bsp::dma::valid(ctx->rx_buffer))
     {
         return types::status::invalid_arg;
     }
@@ -420,7 +362,7 @@ void receive(UART_HandleTypeDef* handle, uint16_t size)
 
     const port port = index_of(handle);
     port_state* ctx = state_of(port);
-    if (ctx == nullptr || !valid_rx_dma_buffer(ctx->rx_buffer))
+    if (ctx == nullptr || !bsp::dma::valid(ctx->rx_buffer))
     {
         return;
     }
@@ -668,7 +610,7 @@ types::status transmit(port port, const uint8_t* data, size_t len, uint32_t time
 types::status start_rx_to_idle(port port, bsp::dma::buffer_view buffer, rx_handler handler,
                                void* user_data, TX_SEMAPHORE* notify_sem)
 {
-    if (!valid_rx_dma_buffer(buffer))
+    if (!bsp::dma::valid(buffer))
     {
         return types::status::invalid_arg;
     }
