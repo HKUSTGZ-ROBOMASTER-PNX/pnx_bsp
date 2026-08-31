@@ -1,6 +1,7 @@
 #pragma once
 
 #include "dma.h"
+#include "bsp_dma.hpp"
 #include "config.hpp"
 #include "tx_api.h"
 #include "usart.h"
@@ -67,7 +68,9 @@ void handle_tx_complete(UART_HandleTypeDef* handle);
 types::status init(port port, mode mode);
 types::status configure(port port, const line_config& config);
 types::status transmit(port port, const uint8_t* data, size_t len, uint32_t timeout_ms);
-types::status start_rx_to_idle(port port, uint8_t* buffer, size_t len, rx_handler handler,
+// The buffer must originate from bsp::dma::buffer and remains owned by the caller.
+// USART uses its full physical capacity for cache maintenance and its logical size for DMA.
+types::status start_rx_to_idle(port port, bsp::dma::buffer_view buffer, rx_handler handler,
                                void* user_data, TX_SEMAPHORE* notify_sem = nullptr);
 types::status restart_rx(port port);
 
