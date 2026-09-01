@@ -1,12 +1,14 @@
 #pragma once
 
+#include "config.hpp"
+
 #include <cstddef>
 #include <cstdint>
 
 namespace bsp::dma
 {
 
-inline constexpr std::size_t cache_line_size = 32U;
+inline constexpr std::size_t cache_line_size = board::memory::cache_line_size;
 
 class buffer_view
 {

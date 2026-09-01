@@ -7,16 +7,13 @@ namespace bsp::dma
 namespace
 {
 
-constexpr std::uintptr_t ram_d1_start = 0x24000000UL;
-constexpr std::uintptr_t ram_d1_end = 0x24050000UL;
-constexpr std::uintptr_t ram_d2_start = 0x30000000UL;
-constexpr std::uintptr_t ram_d2_end = 0x30008000UL;
-
+#if PNX_DMA_DEDICATED_SECTION
 extern "C"
 {
 extern uint8_t _sdma_buffer;
 extern uint8_t _edma_buffer;
 }
+#endif
 
 bool in_range(std::uintptr_t address, std::uintptr_t start, std::uintptr_t end) noexcept
 {
@@ -25,8 +22,19 @@ bool in_range(std::uintptr_t address, std::uintptr_t start, std::uintptr_t end) 
 
 bool is_dma_accessible(std::uintptr_t start, std::uintptr_t end) noexcept
 {
-    return (in_range(start, ram_d1_start, ram_d1_end) && in_range(end - 1U, ram_d1_start, ram_d1_end)) ||
-           (in_range(start, ram_d2_start, ram_d2_end) && in_range(end - 1U, ram_d2_start, ram_d2_end));
+    if constexpr (board::memory::dma_accessible_ranges.empty())
+    {
+        return true;
+    }
+    for (const auto& range : board::memory::dma_accessible_ranges)
+    {
+        if (in_range(start, range.start, range.end) &&
+            in_range(end - 1U, range.start, range.end))
+        {
+            return true;
+        }
+    }
+    return false;
 }
 
 } // namespace
@@ -52,9 +60,13 @@ bool valid(buffer_view buffer) noexcept
         return false;
     }
 
+#if PNX_DMA_DEDICATED_SECTION
     const std::uintptr_t dma_start = reinterpret_cast<std::uintptr_t>(&_sdma_buffer);
     const std::uintptr_t dma_end = reinterpret_cast<std::uintptr_t>(&_edma_buffer);
     return dma_start <= start && end <= dma_end;
+#else
+    return true;
+#endif
 }
 
 } // namespace bsp::dma

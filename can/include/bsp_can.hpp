@@ -15,6 +15,9 @@ struct rx_frame
 {
     uint32_t id = 0;
     uint8_t len = 0;
+    id_type id_kind = id_type::standard;
+    bus_type format = bus_type::classic;
+    bool bit_rate_switch = false;
     uint8_t data[64]{};
 };
 
@@ -27,7 +30,7 @@ bool bus_enabled(std::size_t index) noexcept;
 bus_type configured_bus_type(std::size_t index) noexcept;
 id_type filter_id_type_of(std::size_t index) noexcept;
 
-void receive(FDCAN_HandleTypeDef* handle, uint32_t rx_fifo, bus_type mode);
+void receive(FDCAN_HandleTypeDef* handle, uint32_t rx_fifo);
 void handle_error(FDCAN_HandleTypeDef* handle, uint32_t error_status_its);
 
 types::status init(bus bus, bus_type type);

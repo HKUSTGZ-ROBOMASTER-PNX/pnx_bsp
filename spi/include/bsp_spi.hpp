@@ -11,18 +11,6 @@
 namespace bsp::spi
 {
 
-enum class bus : uint8_t
-{
-    spi2 = 0,
-    spi6 = 1,
-};
-
-enum class cs : uint8_t
-{
-    bmi088_acc = 0,
-    bmi088_gyro = 1,
-};
-
 struct transfer_state
 {
     volatile bool busy = false;
@@ -49,6 +37,4 @@ const transfer_state& state(bus bus) noexcept;
 void handle_tx_complete(SPI_HandleTypeDef* handle) noexcept;
 void handle_rx_complete(SPI_HandleTypeDef* handle) noexcept;
 void handle_error(SPI_HandleTypeDef* handle) noexcept;
-void cs_set(cs line, bool selected);
-
 } // namespace bsp::spi

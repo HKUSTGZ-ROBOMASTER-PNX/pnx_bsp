@@ -15,7 +15,7 @@ struct transfer_context
     bsp::dma::buffer_view dma_buffer{};
 };
 
-std::array<transfer_context, 2U> transfers{};
+std::array<transfer_context, bus_count> transfers{};
 
 const bus_config* config_of(std::size_t index) noexcept
 {
@@ -39,7 +39,8 @@ std::size_t index_of(SPI_HandleTypeDef* handle) noexcept
 {
     for (std::size_t index = 0U; index < transfers.size(); ++index)
     {
-        if (handle_from_id(static_cast<handle_id>(index)) == handle)
+        const bus_config* cfg = config_of(index);
+        if (cfg != nullptr && cfg->enabled && handle_from_id(cfg->handle) == handle)
         {
             return index;
         }
@@ -179,20 +180,6 @@ void complete_transfer(SPI_HandleTypeDef* handle, bool success) noexcept
 
 } // namespace
 
-void cs_set(cs line, bool selected)
-{
-    const GPIO_PinState state = selected ? GPIO_PIN_RESET : GPIO_PIN_SET;
-    switch (line)
-    {
-        case cs::bmi088_acc:
-            HAL_GPIO_WritePin(GPIOC, GPIO_PIN_0, state);
-            break;
-        case cs::bmi088_gyro:
-            HAL_GPIO_WritePin(GPIOC, GPIO_PIN_3, state);
-            break;
-    }
-}
-
 bool bus_enabled(bus bus) noexcept
 {
     const bus_config* cfg = config_of(static_cast<std::size_t>(bus));
@@ -207,22 +194,7 @@ SPI_HandleTypeDef* handle_of(bus bus) noexcept
 
 types::status init(bus bus)
 {
-    if (!bus_enabled(bus))
-    {
-        return types::status::not_configured;
-    }
-
-    switch (bus)
-    {
-        case bus::spi2:
-            cs_set(cs::bmi088_acc, false);
-            cs_set(cs::bmi088_gyro, false);
-            return types::status::ok;
-        case bus::spi6:
-            return types::status::ok;
-        default:
-            return types::status::invalid_arg;
-    }
+    return bus_enabled(bus) ? types::status::ok : types::status::not_configured;
 }
 
 types::status wait_ready(bus bus, uint32_t timeout_ms)
