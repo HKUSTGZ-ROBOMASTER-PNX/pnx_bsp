@@ -91,9 +91,9 @@ void report_tx_result(const tx_result& result)
         tx_mutex_put(&tx_lock);
     }
 
-    if (cdc_config.on_tx_result)
+    if (cdc_config.on_tx_result_callback)
     {
-        cdc_config.on_tx_result(result);
+        cdc_config.on_tx_result_callback(result);
     }
 }
 
@@ -104,7 +104,7 @@ void read_thread_entry(ULONG thread_input)
     while (true)
     {
         refresh_connection();
-        if (usb_state.connected && cdc_config.on_rx)
+        if (usb_state.connected && cdc_config.on_rx_callback)
         {
             ULONG actual_length = 0U;
             UX_SLAVE_CLASS_CDC_ACM* cdc = usb_cdc_handle();
@@ -118,7 +118,7 @@ void read_thread_entry(ULONG thread_input)
             if (status == UX_SUCCESS && actual_length > 0U)
             {
                 ++usb_state.read_count;
-                cdc_config.on_rx(rx_buffer, static_cast<uint16_t>(actual_length));
+                cdc_config.on_rx_callback(rx_buffer, static_cast<uint16_t>(actual_length));
             }
             else if (status != UX_SUCCESS)
             {
@@ -183,7 +183,7 @@ types::status init(const config& cfg)
     {
         return types::status::ok;
     }
-    if (!cfg.on_rx && !cfg.on_tx_result)
+    if (!cfg.on_rx_callback && !cfg.on_tx_result_callback)
     {
         return types::status::invalid_arg;
     }

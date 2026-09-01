@@ -37,8 +37,8 @@ struct config
     uint8_t write_priority = static_cast<uint8_t>(params::usb::write_thread_priority);
     uint32_t period_ticks = params::usb::period_ticks;
     // RX and TX-result callbacks run respectively in USB read/write ThreadX threads.
-    rx_callback on_rx{};
-    core::callback<void(const tx_result&)> on_tx_result{};
+    rx_callback on_rx_callback{};
+    core::callback<void(const tx_result&)> on_tx_result_callback{};
 };
 
 struct runtime_state
@@ -65,7 +65,7 @@ types::status init(const config& cfg);
 bool connected();
 const runtime_state& state();
 
-// CDC is a byte stream: on_rx receives arbitrary chunks, not complete packets.
+// CDC is a byte stream: on_rx_callback receives arbitrary chunks, not complete packets.
 // try_send is thread-context only and copies the bytes before returning.
 types::status try_send(const uint8_t* data, std::size_t len);
 
