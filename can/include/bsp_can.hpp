@@ -37,6 +37,13 @@ types::status init(bus bus, bus_type type);
 types::status restart(bus bus);
 types::status transmit(bus bus, uint32_t id, const uint8_t* data, uint16_t len);
 
+/**
+ * 注册 CAN 接收回调。
+ *
+ * 上下文：在线程/启动阶段调用，且应早于该总线开始接收帧。
+ * 回调运行在 FDCAN 中断路径，不能阻塞。回调对象为借用对象；注册期间
+ * 不得销毁其目标。接收已启动后注册不会与 IRQ 同步。
+ */
 types::status register_rx_callback(bus bus, rx_callback callback);
 void unregister_rx_callbacks(bus bus);
 

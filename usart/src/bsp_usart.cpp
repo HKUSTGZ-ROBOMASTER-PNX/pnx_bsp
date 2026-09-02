@@ -642,17 +642,21 @@ types::status start_rx_to_idle(port port, bsp::dma::buffer_view buffer, rx_callb
         return types::status::invalid_arg;
     }
 
-    if (HAL_UARTEx_ReceiveToIdle_DMA(handle, buffer.data(),
-                                     static_cast<uint16_t>(buffer.logical_size())) != HAL_OK)
-    {
-        return types::status::error;
-    }
-
-    disable_rx_half_transfer_irq(handle);
+    // 启动 DMA 前先发布接收 owner；HAL 一启用接收就可能到达 IDLE 中断。
+    const port_state previous = *ctx;
     ctx->rx_buffer = buffer;
     ctx->rx_position = 0;
     ctx->callback = callback;
     ctx->notify_sem = notify_sem;
+
+    if (HAL_UARTEx_ReceiveToIdle_DMA(handle, buffer.data(),
+                                     static_cast<uint16_t>(buffer.logical_size())) != HAL_OK)
+    {
+        *ctx = previous;
+        return types::status::error;
+    }
+
+    disable_rx_half_transfer_irq(handle);
 
     return types::status::ok;
 }

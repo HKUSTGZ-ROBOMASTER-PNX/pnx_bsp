@@ -70,8 +70,14 @@ void handle_tx_complete(UART_HandleTypeDef* handle);
 types::status init(port port, mode mode);
 types::status configure(port port, const line_config& config);
 types::status transmit(port port, const uint8_t* data, size_t len, uint32_t timeout_ms);
-// The buffer must originate from bsp::dma::buffer and remains owned by the caller.
-// USART uses its full physical capacity for cache maintenance and its logical size for DMA.
+/**
+ * 启动 UART receive-to-idle DMA。
+ *
+ * 上下文：线程/启动阶段。接收回调运行在 UART HAL 中断/DMA 回调路径，
+ * 不能阻塞。`buffer` 和 callback 的目标为借用对象，必须保持有效，直到
+ * 接收停止或以相同 owner 替换。`notify_sem` 非空时，会从该回调路径发出
+ * 信号。buffer 必须来自 `bsp::dma::buffer`。
+ */
 types::status start_rx_to_idle(port port, bsp::dma::buffer_view buffer, rx_callback callback,
                                TX_SEMAPHORE* notify_sem = nullptr);
 types::status restart_rx(port port);
