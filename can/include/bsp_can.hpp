@@ -33,7 +33,7 @@ id_type filter_id_type_of(std::size_t index) noexcept;
 void receive(FDCAN_HandleTypeDef* handle, uint32_t rx_fifo);
 void handle_error(FDCAN_HandleTypeDef* handle, uint32_t error_status_its);
 
-types::status init(bus bus, bus_type type);
+types::status init(bus bus);
 types::status restart(bus bus);
 types::status transmit(bus bus, uint32_t id, const uint8_t* data, uint16_t len);
 

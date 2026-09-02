@@ -424,7 +424,7 @@ void receive(FDCAN_HandleTypeDef* handle, uint32_t rx_fifo)
     notify_rx(bus, frame);
 }// ?多态完了我怎么知道对应哪个can 哪个id有回调
 
-types::status init(bus bus, bus_type type)
+types::status init(bus bus)
 {
     const std::size_t idx = static_cast<std::size_t>(bus);
     if (idx >= bus_count)
@@ -438,8 +438,8 @@ types::status init(bus bus, bus_type type)
     }
 
     const bus_config* cfg = config_of(idx);
-    if (cfg == nullptr || type != cfg->type ||
-        (type == bus_type::fd && cfg->capability == bus_capability::classic))
+    if (cfg == nullptr ||
+        (cfg->type == bus_type::fd && cfg->capability == bus_capability::classic))
     {
         return types::status::not_configured;
     }
@@ -460,7 +460,7 @@ types::status init(bus bus, bus_type type)
         bsp::can::diag::init(); // 惰性创建采样定时器（只创建一次）
     }
 
-    if (type == bus_type::classic)
+    if (cfg->type == bus_type::classic)
     {
         status = init_classic(bus);
     }
@@ -474,7 +474,7 @@ types::status init(bus bus, bus_type type)
         return status;
     }
 
-    active_types[idx] = type;
+    active_types[idx] = cfg->type;
     initialized[idx] = true;
     return types::status::ok;
 }
