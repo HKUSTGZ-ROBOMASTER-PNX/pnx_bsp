@@ -22,25 +22,11 @@ const bus_config* config_of(std::size_t index) noexcept
     return index < bus_count ? &configs[index] : nullptr;
 }
 
-SPI_HandleTypeDef* handle_from_id(handle_id id) noexcept
-{
-    switch (id)
-    {
-    case handle_id::spi2:
-        return &hspi2;
-    case handle_id::spi6:
-        return &hspi6;
-    default:
-        return nullptr;
-    }
-}
-
 std::size_t index_of(SPI_HandleTypeDef* handle) noexcept
 {
     for (std::size_t index = 0U; index < transfers.size(); ++index)
     {
-        const bus_config* cfg = config_of(index);
-        if (cfg != nullptr && cfg->enabled && handle_from_id(cfg->handle) == handle)
+        if (handle_of(static_cast<bus>(index)) == handle)
         {
             return index;
         }
@@ -48,14 +34,20 @@ std::size_t index_of(SPI_HandleTypeDef* handle) noexcept
     return transfers.size();
 }
 
-bool supports_it(SPI_HandleTypeDef* handle) noexcept
+bool supports_it(bus bus_id) noexcept
 {
-    return handle != nullptr && handle->Instance == SPI2;
+    detail::binding binding{};
+    return detail::binding_for(bus_id, binding) && binding.spi != nullptr && binding.has_irq;
 }
 
-bool supports_dma(SPI_HandleTypeDef* handle) noexcept
+bool supports_dma(bus bus_id, bool receive) noexcept
 {
-    return supports_it(handle) && handle->hdmatx != nullptr && handle->hdmarx != nullptr;
+    detail::binding binding{};
+    if (!detail::binding_for(bus_id, binding) || binding.spi == nullptr)
+    {
+        return false;
+    }
+    return receive ? binding.has_rx_dma : binding.has_tx_dma;
 }
 
 bool cache_range(bsp::dma::buffer_view buffer, std::uintptr_t& aligned_start,
@@ -145,7 +137,7 @@ types::status begin_transfer(bus bus_id, bool receive, bool dma, SPI_HandleTypeD
     {
         return types::status::busy;
     }
-    if ((dma && !supports_dma(handle)) || (!dma && !supports_it(handle)))
+    if ((dma && !supports_dma(bus_id, receive)) || (!dma && !supports_it(bus_id)))
     {
         return types::status::not_configured;
     }
@@ -188,8 +180,12 @@ bool bus_enabled(bus bus) noexcept
 
 SPI_HandleTypeDef* handle_of(bus bus) noexcept
 {
-    const bus_config* cfg = config_of(static_cast<std::size_t>(bus));
-    return cfg != nullptr && cfg->enabled ? handle_from_id(cfg->handle) : nullptr;
+    if (!bus_enabled(bus))
+    {
+        return nullptr;
+    }
+    detail::binding binding{};
+    return detail::binding_for(bus, binding) ? binding.spi : nullptr;
 }
 
 types::status init(bus bus)

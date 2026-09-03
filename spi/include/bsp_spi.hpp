@@ -38,3 +38,18 @@ void handle_tx_complete(SPI_HandleTypeDef* handle) noexcept;
 void handle_rx_complete(SPI_HandleTypeDef* handle) noexcept;
 void handle_error(SPI_HandleTypeDef* handle) noexcept;
 } // namespace bsp::spi
+
+namespace bsp::spi::detail
+{
+
+struct binding
+{
+    SPI_HandleTypeDef* spi = nullptr;
+    bool has_irq = false;
+    bool has_rx_dma = false;
+    bool has_tx_dma = false;
+};
+
+bool binding_for(bus bus_id, binding& out) noexcept;
+
+} // namespace bsp::spi::detail
