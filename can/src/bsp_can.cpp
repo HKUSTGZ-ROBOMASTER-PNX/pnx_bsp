@@ -157,7 +157,26 @@ void notify_rx(bus bus, const rx_frame& frame)
     }
 }
 
-types::status configure_filter(bus bus) noexcept
+types::status configured_rx_fifo(FDCAN_HandleTypeDef* handle, uint32_t& fifo) noexcept
+{
+    if (handle == nullptr)
+    {
+        return types::status::invalid_arg;
+    }
+
+    const bool fifo0_enabled = handle->Init.RxFifo0ElmtsNbr > 0U;
+    const bool fifo1_enabled = handle->Init.RxFifo1ElmtsNbr > 0U;
+    if (fifo0_enabled == fifo1_enabled)
+    {
+        // The IOC must enable exactly one receive FIFO for each FDCAN instance.
+        return types::status::not_configured;
+    }
+
+    fifo = fifo0_enabled ? FDCAN_RX_FIFO0 : FDCAN_RX_FIFO1;
+    return types::status::ok;
+}
+
+types::status configure_filter(bus bus, uint32_t fifo) noexcept
 {
     const bus_config* cfg = config_of(static_cast<std::size_t>(bus));
     FDCAN_HandleTypeDef* handle = handle_of(bus);
@@ -170,8 +189,8 @@ types::status configure_filter(bus bus) noexcept
                                                              : FDCAN_STANDARD_ID;
     filter.FilterIndex = 0U;
     filter.FilterType = FDCAN_FILTER_MASK;
-    filter.FilterConfig = cfg->fifo == rx_fifo::fifo1 ? FDCAN_FILTER_TO_RXFIFO1
-                                                       : FDCAN_FILTER_TO_RXFIFO0;
+    filter.FilterConfig = fifo == FDCAN_RX_FIFO1 ? FDCAN_FILTER_TO_RXFIFO1
+                                                  : FDCAN_FILTER_TO_RXFIFO0;
     filter.FilterID1 = 0x000U;
     filter.FilterID2 = 0x000U;
 
@@ -194,8 +213,21 @@ types::status init_classic(bus bus)
     {
         return types::status::not_configured;
     }
-    uint32_t notification = (cfg->fifo == rx_fifo::fifo1 ? FDCAN_IT_RX_FIFO1_NEW_MESSAGE
-                                                          : FDCAN_IT_RX_FIFO0_NEW_MESSAGE) |
+    FDCAN_HandleTypeDef* handle = handle_of(bus);
+    if (handle == nullptr)
+    {
+        return types::status::invalid_arg;
+    }
+
+    uint32_t fifo = FDCAN_RX_FIFO0;
+    types::status status = configured_rx_fifo(handle, fifo);
+    if (status != types::status::ok)
+    {
+        return status;
+    }
+
+    uint32_t notification = (fifo == FDCAN_RX_FIFO1 ? FDCAN_IT_RX_FIFO1_NEW_MESSAGE
+                                                     : FDCAN_IT_RX_FIFO0_NEW_MESSAGE) |
                             FDCAN_IT_ERROR_WARNING |
                             FDCAN_IT_ERROR_PASSIVE |
                             FDCAN_IT_ARB_PROTOCOL_ERROR |
@@ -206,12 +238,7 @@ types::status init_classic(bus bus)
         notification |= FDCAN_IT_RX_FIFO0_MESSAGE_LOST | FDCAN_IT_RX_FIFO1_MESSAGE_LOST;
     }
 
-    FDCAN_HandleTypeDef* handle = handle_of(bus);
-    if (handle == nullptr)
-    {
-        return types::status::invalid_arg;
-    }
-    types::status status = configure_filter(bus);
+    status = configure_filter(bus, fifo);
     if (status != types::status::ok)
     {
         return status;
@@ -234,8 +261,21 @@ types::status init_fd(bus bus)
     {
         return types::status::not_configured;
     }
-    uint32_t notification = (cfg->fifo == rx_fifo::fifo1 ? FDCAN_IT_RX_FIFO1_NEW_MESSAGE
-                                                          : FDCAN_IT_RX_FIFO0_NEW_MESSAGE) |
+    FDCAN_HandleTypeDef* handle = handle_of(bus);
+    if (handle == nullptr)
+    {
+        return types::status::invalid_arg;
+    }
+
+    uint32_t fifo = FDCAN_RX_FIFO0;
+    types::status status = configured_rx_fifo(handle, fifo);
+    if (status != types::status::ok)
+    {
+        return status;
+    }
+
+    uint32_t notification = (fifo == FDCAN_RX_FIFO1 ? FDCAN_IT_RX_FIFO1_NEW_MESSAGE
+                                                     : FDCAN_IT_RX_FIFO0_NEW_MESSAGE) |
                             FDCAN_IT_ERROR_WARNING |
                             FDCAN_IT_ERROR_PASSIVE |
                             FDCAN_IT_ARB_PROTOCOL_ERROR |
@@ -246,12 +286,7 @@ types::status init_fd(bus bus)
         notification |= FDCAN_IT_RX_FIFO0_MESSAGE_LOST | FDCAN_IT_RX_FIFO1_MESSAGE_LOST;
     }
 
-    FDCAN_HandleTypeDef* handle = handle_of(bus);
-    if (handle == nullptr)
-    {
-        return types::status::invalid_arg;
-    }
-    types::status status = configure_filter(bus);
+    status = configure_filter(bus, fifo);
     if (status != types::status::ok)
     {
         return status;
