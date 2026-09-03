@@ -295,15 +295,6 @@ types::status init_fd(bus bus)
     {
         return types::status::error;
     }
-    if (cfg->tdc.enabled &&
-        HAL_FDCAN_ConfigTxDelayCompensation(handle, cfg->tdc.offset, cfg->tdc.filter) != HAL_OK)
-    {
-        return types::status::error;
-    }
-    if (cfg->tdc.enabled && HAL_FDCAN_EnableTxDelayCompensation(handle) != HAL_OK)
-    {
-        return types::status::error;
-    }
     if (HAL_FDCAN_Start(handle) != HAL_OK)
     {
         return types::status::error;
