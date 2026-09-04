@@ -1,6 +1,7 @@
 #pragma once
 
 #include "config.hpp"
+#include "callback.hpp"
 #include "fdcan.h"
 #include "tx_api.h"
 #include "usertypes.hpp"
@@ -14,10 +15,14 @@ struct rx_frame
 {
     uint32_t id = 0;
     uint8_t len = 0;
+    id_type id_kind = id_type::standard;
+    bus_type format = bus_type::classic;
+    bool bit_rate_switch = false;
     uint8_t data[64]{};
 };
 
-using rx_handler = void (*)(bus bus, const rx_frame& frame, void* user_data);
+// Invoked from the FDCAN HAL interrupt path; it must not block.
+using rx_callback = core::callback<void(bus, const rx_frame&)>;
 
 FDCAN_HandleTypeDef* handle_of(bus b) noexcept;
 bus bus_of(FDCAN_HandleTypeDef* handle) noexcept;
@@ -25,15 +30,22 @@ bool bus_enabled(std::size_t index) noexcept;
 bus_type configured_bus_type(std::size_t index) noexcept;
 id_type filter_id_type_of(std::size_t index) noexcept;
 
-void receive(FDCAN_HandleTypeDef* handle, uint32_t rx_fifo, bus_type mode);
+void receive(FDCAN_HandleTypeDef* handle, uint32_t rx_fifo);
 void handle_error(FDCAN_HandleTypeDef* handle, uint32_t error_status_its);
 
-types::status init(bus bus, bus_type type);
+types::status init(bus bus);
 types::status restart(bus bus);
 types::status transmit(bus bus, uint32_t id, const uint8_t* data, uint16_t len);
 
-types::status register_rx_handler(bus bus, rx_handler handler, void* user_data);
-void unregister_rx_handlers(bus bus);
+/**
+ * 注册 CAN 接收回调。
+ *
+ * 上下文：在线程/启动阶段调用，且应早于该总线开始接收帧。
+ * 回调运行在 FDCAN 中断路径，不能阻塞。回调对象为借用对象；注册期间
+ * 不得销毁其目标。接收已启动后注册不会与 IRQ 同步。
+ */
+types::status register_rx_callback(bus bus, rx_callback callback);
+void unregister_rx_callbacks(bus bus);
 
 TX_SEMAPHORE* err_sem(bus bus);
 

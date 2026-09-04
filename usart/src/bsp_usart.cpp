@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <limits>
 
 extern "C" {
 extern DMA_HandleTypeDef hdma_uart5_rx;
@@ -18,12 +19,6 @@ namespace
 {
 
 constexpr uint16_t dma_tx_stage_size = 256;
-constexpr std::uintptr_t ram_d1_start = 0x24000000UL;
-constexpr std::uintptr_t ram_d1_end = 0x24050000UL;
-constexpr std::uintptr_t ram_d2_start = 0x30000000UL;
-constexpr std::uintptr_t ram_d2_end = 0x30008000UL;
-constexpr std::uintptr_t ram_d3_start = 0x38000000UL;
-constexpr std::uintptr_t ram_d3_end = 0x38004000UL;
 constexpr std::uintptr_t dcache_line_size = 32U;
 
 struct port_state
@@ -31,17 +26,14 @@ struct port_state
     bool initialized = false;
     bool tx_busy = false;
     bsp::usart::mode port_mode = bsp::usart::mode::block;
-    bsp::usart::rx_handler handler = nullptr;
-    void* user_data = nullptr;
+    bsp::usart::rx_callback callback{};
     TX_SEMAPHORE* notify_sem = nullptr;
-    uint8_t* rx_buffer = nullptr;
-    size_t rx_buffer_len = 0;
+    bsp::dma::buffer_view rx_buffer{};
     size_t rx_position = 0;
 };
 
 port_state ports[bsp::usart::port_count]{};
-alignas(dcache_line_size)
-uint8_t tx_dma_stage_buffers[bsp::usart::port_count][dma_tx_stage_size] RAM_D1_BSS{};
+bsp::dma::buffer<dma_tx_stage_size> tx_dma_stage_buffers[bsp::usart::port_count] BSP_DMA_BUFFER{};
 
 port_state* state_of(bsp::usart::port port)
 {
@@ -53,14 +45,14 @@ port_state* state_of(bsp::usart::port port)
     return &ports[port];
 }
 
-uint8_t* tx_dma_stage_of(bsp::usart::port port)
+bsp::dma::buffer<dma_tx_stage_size>* tx_dma_stage_of(bsp::usart::port port)
 {
     if (static_cast<std::uint8_t>(port) >= bsp::usart::port_count)
     {
         return nullptr;
     }
 
-    return tx_dma_stage_buffers[port];
+    return &tx_dma_stage_buffers[port];
 }
 
 std::uintptr_t align_down(std::uintptr_t value, std::uintptr_t alignment)
@@ -73,62 +65,107 @@ std::uintptr_t align_up(std::uintptr_t value, std::uintptr_t alignment)
     return (value + alignment - 1U) & ~(alignment - 1U);
 }
 
-bool in_range(std::uintptr_t addr, std::uintptr_t start, std::uintptr_t end)
+bool cache_range_in_owner(bsp::dma::buffer_view buffer, size_t offset, size_t len,
+                          std::uintptr_t& aligned_start, std::uintptr_t& aligned_end)
 {
-    return addr >= start && addr < end;
-}
-
-bool is_dma_accessible_buffer(const void* buffer, size_t len)
-{
-    if (buffer == nullptr || len == 0)
+    if (buffer.data() == nullptr || buffer.capacity() == 0U || offset > buffer.capacity() ||
+        len > buffer.capacity() - offset)
     {
         return false;
     }
 
-    const auto start = reinterpret_cast<std::uintptr_t>(buffer);
-    const auto last = start + len - 1U;
-
-    return (in_range(start, ram_d1_start, ram_d1_end) && in_range(last, ram_d1_start, ram_d1_end)) ||
-           (in_range(start, ram_d2_start, ram_d2_end) && in_range(last, ram_d2_start, ram_d2_end)) ||
-           (in_range(start, ram_d3_start, ram_d3_end) && in_range(last, ram_d3_start, ram_d3_end));
-}
-
-void clean_dcache_region(const void* buffer, size_t len)
-{
-#if defined(__DCACHE_PRESENT) && (__DCACHE_PRESENT == 1U)
-    if (buffer == nullptr || len == 0)
+    const std::uintptr_t owner_start = reinterpret_cast<std::uintptr_t>(buffer.data());
+    if (owner_start > std::numeric_limits<std::uintptr_t>::max() - buffer.capacity())
     {
-        return;
+        return false;
+    }
+    const std::uintptr_t owner_end = owner_start + buffer.capacity();
+    if (owner_start > std::numeric_limits<std::uintptr_t>::max() - offset)
+    {
+        return false;
+    }
+    const std::uintptr_t start = owner_start + offset;
+    if (start > std::numeric_limits<std::uintptr_t>::max() - len)
+    {
+        return false;
+    }
+    if (start + len > std::numeric_limits<std::uintptr_t>::max() - (dcache_line_size - 1U))
+    {
+        return false;
     }
 
-    const auto start = reinterpret_cast<std::uintptr_t>(buffer);
-    const auto aligned_start = align_down(start, dcache_line_size);
-    const auto aligned_end = align_up(start + len, dcache_line_size);
+    aligned_start = align_down(start, dcache_line_size);
+    aligned_end = align_up(start + len, dcache_line_size);
+    return aligned_start >= owner_start && aligned_end <= owner_end && aligned_end >= aligned_start;
+}
+
+bool invalidate_rx_region(bsp::dma::buffer_view buffer, size_t offset, size_t len)
+{
+#if defined(__DCACHE_PRESENT) && (__DCACHE_PRESENT == 1U)
+    if (offset > buffer.logical_size() || len > buffer.logical_size() - offset)
+    {
+        return false;
+    }
+    if (len == 0U)
+    {
+        return true;
+    }
+
+    std::uintptr_t aligned_start = 0U;
+    std::uintptr_t aligned_end = 0U;
+    if (!cache_range_in_owner(buffer, offset, len, aligned_start, aligned_end))
+    {
+        return false;
+    }
+    SCB_InvalidateDCache_by_Addr(reinterpret_cast<uint32_t*>(aligned_start),
+                                 static_cast<int32_t>(aligned_end - aligned_start));
+    return true;
+#else
+    (void)buffer;
+    (void)offset;
+    (void)len;
+    return true;
+#endif
+}
+
+bool prepare_rx_dma_buffer(bsp::dma::buffer_view buffer)
+{
+#if defined(__DCACHE_PRESENT) && (__DCACHE_PRESENT == 1U)
+    std::uintptr_t aligned_start = 0U;
+    std::uintptr_t aligned_end = 0U;
+    if (!cache_range_in_owner(buffer, 0U, buffer.capacity(), aligned_start, aligned_end))
+    {
+        return false;
+    }
+    SCB_InvalidateDCache_by_Addr(reinterpret_cast<uint32_t*>(aligned_start),
+                                 static_cast<int32_t>(aligned_end - aligned_start));
+#else
+    (void)buffer;
+#endif
+    return true;
+}
+
+bool clean_tx_dma_buffer(bsp::dma::buffer_view buffer, size_t len)
+{
+#if defined(__DCACHE_PRESENT) && (__DCACHE_PRESENT == 1U)
+    if (len == 0U)
+    {
+        return false;
+    }
+
+    std::uintptr_t aligned_start = 0U;
+    std::uintptr_t aligned_end = 0U;
+    if (!cache_range_in_owner(buffer, 0U, len, aligned_start, aligned_end))
+    {
+        return false;
+    }
     SCB_CleanDCache_by_Addr(reinterpret_cast<uint32_t*>(aligned_start),
                             static_cast<int32_t>(aligned_end - aligned_start));
 #else
     (void)buffer;
     (void)len;
 #endif
-}
-
-void invalidate_dcache_region(const void* buffer, size_t len)
-{
-#if defined(__DCACHE_PRESENT) && (__DCACHE_PRESENT == 1U)
-    if (buffer == nullptr || len == 0)
-    {
-        return;
-    }
-
-    const auto start = reinterpret_cast<std::uintptr_t>(buffer);
-    const auto aligned_start = align_down(start, dcache_line_size);
-    const auto aligned_end = align_up(start + len, dcache_line_size);
-    SCB_InvalidateDCache_by_Addr(reinterpret_cast<uint32_t*>(aligned_start),
-                                 static_cast<int32_t>(aligned_end - aligned_start));
-#else
-    (void)buffer;
-    (void)len;
-#endif
+    return true;
 }
 
 void notify_rx(bsp::usart::port port, uint8_t* data, size_t len)
@@ -144,9 +181,9 @@ void notify_rx(bsp::usart::port port, uint8_t* data, size_t len)
     {
         tx_semaphore_put(ctx->notify_sem);
     }
-    if (ctx->handler != nullptr)
+    if (ctx->callback)
     {
-        ctx->handler(port, frame, ctx->user_data);
+        ctx->callback(port, frame);
     }
 }
 
@@ -164,11 +201,12 @@ void disable_rx_half_transfer_irq(UART_HandleTypeDef* handle)
     }
 }
 
-bool same_rx_owner(const port_state& ctx, uint8_t* buffer, size_t len, bsp::usart::rx_handler handler,
-                   void* user_data, TX_SEMAPHORE* notify_sem)
+bool same_rx_owner(const port_state& ctx, bsp::dma::buffer_view buffer, bsp::usart::rx_callback callback,
+                   TX_SEMAPHORE* notify_sem)
 {
-    return ctx.rx_buffer == buffer && ctx.rx_buffer_len == len && ctx.handler == handler &&
-           ctx.user_data == user_data && ctx.notify_sem == notify_sem;
+    return ctx.rx_buffer.data() == buffer.data() && ctx.rx_buffer.logical_size() == buffer.logical_size() &&
+           ctx.rx_buffer.capacity() == buffer.capacity() && ctx.callback == callback &&
+           ctx.notify_sem == notify_sem;
 }
 
 } // namespace
@@ -291,20 +329,24 @@ types::status restart_rx(port port)
 {
     port_state* ctx = state_of(port);
     UART_HandleTypeDef* handle = handle_of(port);
-    if (ctx == nullptr || handle == nullptr || ctx->rx_buffer == nullptr || ctx->rx_buffer_len == 0)
+    if (ctx == nullptr || handle == nullptr || !bsp::dma::valid(ctx->rx_buffer))
     {
         return types::status::invalid_arg;
     }
 
-    if (HAL_UARTEx_ReceiveToIdle_DMA(handle, ctx->rx_buffer,
-                                     static_cast<uint16_t>(ctx->rx_buffer_len)) != HAL_OK)
+    if (!prepare_rx_dma_buffer(ctx->rx_buffer))
+    {
+        return types::status::invalid_arg;
+    }
+
+    if (HAL_UARTEx_ReceiveToIdle_DMA(handle, ctx->rx_buffer.data(),
+                                     static_cast<uint16_t>(ctx->rx_buffer.logical_size())) != HAL_OK)
     {
         return types::status::error;
     }
 
     disable_rx_half_transfer_irq(handle);
     ctx->rx_position = 0;
-    invalidate_dcache_region(ctx->rx_buffer, ctx->rx_buffer_len);
 
     return types::status::ok;
 }
@@ -319,14 +361,18 @@ void receive(UART_HandleTypeDef* handle, uint16_t size)
 
     const port port = index_of(handle);
     port_state* ctx = state_of(port);
-    if (ctx == nullptr || ctx->rx_buffer == nullptr)
+    if (ctx == nullptr || !bsp::dma::valid(ctx->rx_buffer))
     {
         return;
     }
 
     if (rx_dma_is_circular(handle))
     {
-        const size_t buffer_len = ctx->rx_buffer_len;
+        const size_t buffer_len = ctx->rx_buffer.logical_size();
+        if (size > buffer_len)
+        {
+            return;
+        }
         const size_t position = size < buffer_len ? size : 0U;
 
         if (event == HAL_UART_RXEVENT_TC)
@@ -334,8 +380,10 @@ void receive(UART_HandleTypeDef* handle, uint16_t size)
             if (ctx->rx_position < buffer_len)
             {
                 const size_t len = buffer_len - ctx->rx_position;
-                invalidate_dcache_region(ctx->rx_buffer + ctx->rx_position, len);
-                notify_rx(port, ctx->rx_buffer + ctx->rx_position, len);
+                if (invalidate_rx_region(ctx->rx_buffer, ctx->rx_position, len))
+                {
+                    notify_rx(port, ctx->rx_buffer.data() + ctx->rx_position, len);
+                }
             }
             ctx->rx_position = 0;
             return;
@@ -344,26 +392,35 @@ void receive(UART_HandleTypeDef* handle, uint16_t size)
         if (position > ctx->rx_position)
         {
             const size_t len = position - ctx->rx_position;
-            invalidate_dcache_region(ctx->rx_buffer + ctx->rx_position, len);
-            notify_rx(port, ctx->rx_buffer + ctx->rx_position, len);
+            if (invalidate_rx_region(ctx->rx_buffer, ctx->rx_position, len))
+            {
+                notify_rx(port, ctx->rx_buffer.data() + ctx->rx_position, len);
+            }
         }
         else if (position < ctx->rx_position)
         {
             const size_t tail_len = buffer_len - ctx->rx_position;
-            invalidate_dcache_region(ctx->rx_buffer + ctx->rx_position, tail_len);
-            notify_rx(port, ctx->rx_buffer + ctx->rx_position, tail_len);
+            if (invalidate_rx_region(ctx->rx_buffer, ctx->rx_position, tail_len))
+            {
+                notify_rx(port, ctx->rx_buffer.data() + ctx->rx_position, tail_len);
+            }
             if (position > 0U)
             {
-                invalidate_dcache_region(ctx->rx_buffer, position);
-                notify_rx(port, ctx->rx_buffer, position);
+                if (invalidate_rx_region(ctx->rx_buffer, 0U, position))
+                {
+                    notify_rx(port, ctx->rx_buffer.data(), position);
+                }
             }
         }
         ctx->rx_position = position;
         return;
     }
 
-    invalidate_dcache_region(ctx->rx_buffer, size);
-    notify_rx(port, ctx->rx_buffer, size);
+    if (size > ctx->rx_buffer.logical_size() || !invalidate_rx_region(ctx->rx_buffer, 0U, size))
+    {
+        return;
+    }
+    notify_rx(port, ctx->rx_buffer.data(), size);
     restart_rx(port);
 }
 
@@ -430,7 +487,7 @@ types::status configure(port port, const line_config& config)
 
     UART_HandleTypeDef* handle = handle_of(port);
     port_state* ctx = state_of(port);
-    if (handle == nullptr || ctx == nullptr || ctx->rx_buffer != nullptr)
+    if (handle == nullptr || ctx == nullptr || ctx->rx_buffer.data() != nullptr)
     {
         return types::status::invalid_arg;
     }
@@ -519,22 +576,19 @@ types::status transmit(port port, const uint8_t* data, size_t len, uint32_t time
             return types::status::busy;
         }
 
-        const uint8_t* dma_buffer = data;
-        if (!is_dma_accessible_buffer(data, len))
+        bsp::dma::buffer<dma_tx_stage_size>* tx_dma_stage = tx_dma_stage_of(port);
+        if (tx_dma_stage == nullptr || len > tx_dma_stage->logical_size())
         {
-            uint8_t* tx_dma_stage = tx_dma_stage_of(port);
-            if (tx_dma_stage == nullptr || len > dma_tx_stage_size)
-            {
-                return types::status::invalid_arg;
-            }
-
-            std::memcpy(tx_dma_stage, data, len);
-            dma_buffer = tx_dma_stage;
+            return types::status::invalid_arg;
         }
 
+        std::memcpy(tx_dma_stage->data(), data, len);
+        if (!clean_tx_dma_buffer(tx_dma_stage->view(), len))
+        {
+            return types::status::invalid_arg;
+        }
         ctx->tx_busy = true;
-        clean_dcache_region(dma_buffer, len);
-        if (HAL_UART_Transmit_DMA(handle, const_cast<uint8_t*>(dma_buffer), static_cast<uint16_t>(len)) !=
+        if (HAL_UART_Transmit_DMA(handle, tx_dma_stage->data(), static_cast<uint16_t>(len)) !=
             HAL_OK)
         {
             ctx->tx_busy = false;
@@ -552,10 +606,10 @@ types::status transmit(port port, const uint8_t* data, size_t len, uint32_t time
     return types::status::ok;
 }
 
-types::status start_rx_to_idle(port port, uint8_t* buffer, size_t len, rx_handler handler,
-                               void* user_data, TX_SEMAPHORE* notify_sem)
+types::status start_rx_to_idle(port port, bsp::dma::buffer_view buffer, rx_callback callback,
+                               TX_SEMAPHORE* notify_sem)
 {
-    if (buffer == nullptr || len == 0)
+    if (!bsp::dma::valid(buffer))
     {
         return types::status::invalid_arg;
     }
@@ -577,31 +631,32 @@ types::status start_rx_to_idle(port port, uint8_t* buffer, size_t len, rx_handle
         return types::status::error;
     }
 
-    if (ctx->rx_buffer != nullptr &&
-        !same_rx_owner(*ctx, buffer, len, handler, user_data, notify_sem))
+    if (ctx->rx_buffer.data() != nullptr &&
+        !same_rx_owner(*ctx, buffer, callback, notify_sem))
     {
         return types::status::busy;
     }
 
-    if (ctx->port_mode == mode::dma && !is_dma_accessible_buffer(buffer, len))
+    if (!prepare_rx_dma_buffer(buffer))
     {
         return types::status::invalid_arg;
     }
 
+    // 启动 DMA 前先发布接收 owner；HAL 一启用接收就可能到达 IDLE 中断。
+    const port_state previous = *ctx;
     ctx->rx_buffer = buffer;
-    ctx->rx_buffer_len = len;
     ctx->rx_position = 0;
-    ctx->handler = handler;
-    ctx->user_data = user_data;
+    ctx->callback = callback;
     ctx->notify_sem = notify_sem;
 
-    if (HAL_UARTEx_ReceiveToIdle_DMA(handle, buffer, static_cast<uint16_t>(len)) != HAL_OK)
+    if (HAL_UARTEx_ReceiveToIdle_DMA(handle, buffer.data(),
+                                     static_cast<uint16_t>(buffer.logical_size())) != HAL_OK)
     {
+        *ctx = previous;
         return types::status::error;
     }
 
     disable_rx_half_transfer_irq(handle);
-    invalidate_dcache_region(buffer, len);
 
     return types::status::ok;
 }
