@@ -26,6 +26,10 @@ SPI_HandleTypeDef* handle_of(bus bus) noexcept;
 types::status init(bus bus);
 types::status transmit(bus bus, const uint8_t* data, size_t len, uint32_t timeout_ms);
 types::status receive(bus bus, uint8_t* data, size_t len, uint32_t timeout_ms);
+// Blocking full-duplex exchange. Both buffers remain owned by the caller for
+// the duration of the call.
+types::status transmit_receive(bus bus, const uint8_t* tx, uint8_t* rx, size_t len,
+                               uint32_t timeout_ms);
 // IT buffers remain owned by the caller until the transfer state reports completion.
 types::status transmit_it(bus bus, const uint8_t* data, size_t len);
 types::status receive_it(bus bus, uint8_t* data, size_t len);

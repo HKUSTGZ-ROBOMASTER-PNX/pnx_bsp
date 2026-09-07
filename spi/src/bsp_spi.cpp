@@ -261,6 +261,27 @@ types::status receive(bus bus, uint8_t* data, size_t len, uint32_t timeout_ms)
     return types::status::ok;
 }
 
+types::status transmit_receive(bus bus, const uint8_t* tx, uint8_t* rx, size_t len,
+                               uint32_t timeout_ms)
+{
+    if (!bus_enabled(bus))
+    {
+        return types::status::not_configured;
+    }
+
+    SPI_HandleTypeDef* handle = handle_of(bus);
+    if (handle == nullptr || tx == nullptr || rx == nullptr || len == 0U ||
+        len > std::numeric_limits<uint16_t>::max())
+    {
+        return types::status::invalid_arg;
+    }
+
+    return HAL_SPI_TransmitReceive(handle, const_cast<uint8_t*>(tx), rx,
+                                   static_cast<uint16_t>(len), timeout_ms) == HAL_OK
+               ? types::status::ok
+               : types::status::error;
+}
+
 types::status transmit_it(bus bus_id, const uint8_t* data, size_t len)
 {
     if (data == nullptr || len == 0U || len > std::numeric_limits<uint16_t>::max())
