@@ -1,6 +1,8 @@
 #pragma once
 
+#include "callback.hpp"
 #include "config.hpp"
+#include "tx_api.h"
 #include "usertypes.hpp"
 
 #include <cstddef>
@@ -11,69 +13,31 @@ namespace bsp::can
 
 struct rx_frame
 {
-    std::uint32_t id = 0;
-    std::uint32_t tick = 0;
-    std::uint8_t len = 0;
-    std::uint8_t data[64]{};
+    uint32_t id = 0;
+    uint8_t len = 0;
+    id_type id_kind = id_type::standard;
+    bus_type format = bus_type::classic;
+    bool bit_rate_switch = false;
+    uint8_t data[64]{};
 };
 
-enum class state : std::uint8_t
-{
-    stopped = 0,
-    active,
-    warning,
-    passive,
-    bus_off,
-    recovering,
-    fault,
-};
-
-struct telemetry
-{
-    std::uint32_t rx_count = 0;
-    std::uint32_t tx_count = 0;
-    std::uint32_t last_id = 0;
-    std::uint32_t last_tick = 0;
-    std::uint32_t error_count = 0;
-    std::uint32_t bus_off_count = 0;
-    std::uint32_t drop_count = 0;
-    std::uint32_t fault_epoch = 0;
-    state bus_state = state::stopped;
-};
-
-using rx_handler = void (*)(bus bus, const rx_frame& frame, void* user_data);
+// Invoked from the CAN HAL interrupt path; it must not block.
+using rx_callback = core::callback<void(bus, const rx_frame&)>;
 
 bool bus_enabled(std::size_t index) noexcept;
 bus_type configured_bus_type(std::size_t index) noexcept;
 id_type filter_id_type_of(std::size_t index) noexcept;
 
-types::status init(bus bus, bus_type type);
-// Thread-context recovery only; board ISR paths must only record or schedule it.
-types::status recover(bus bus);
-types::status transmit(bus bus, std::uint32_t id, const std::uint8_t* data,
-                       std::uint16_t len);
-// DEFERRED / PROVISIONAL -- no production caller as of 2026-08.
-//
-// Guarded transmit: sends only if the bus counters still match what the caller
-// last observed via snapshot(), so a caller can refuse to transmit onto a bus
-// that has degraded since its last check. Currently exercised only by the host
-// contract tests (tests/host/can_host_tests.cpp).
-//
-// Intended sole consumer is a control-side CAN writer (e.g. chassis runtime)
-// that needs transmit and health-check to be one decision. Until such a caller
-// exists, treat this entry point as unstable: do not build new APIs on top of
-// it, and re-evaluate whether it should stay in the shared contract when CAN is
-// first integrated into a product application. Plain transmit() plus snapshot()
-// covers every present use.
-types::status transmit_if_healthy(
-    bus bus, std::uint32_t id, const std::uint8_t* data,
-    std::uint16_t len, std::uint32_t expected_error_count,
-    std::uint32_t expected_drop_count,
-    std::uint32_t expected_fault_epoch);
+types::status init(bus bus);
+types::status restart(bus bus);
+types::status transmit(bus bus, uint32_t id, const uint8_t* data, uint16_t len);
 
-types::status register_rx_handler(bus bus, rx_handler handler, void* user_data);
-void unregister_rx_handlers(bus bus);
-telemetry snapshot(bus bus) noexcept;
-std::uint32_t time_now() noexcept;
+// Register before starting reception. The borrowed callback target must remain
+// alive until it is unregistered. Callback execution occurs in CAN IRQ context
+// and must not block. Registration is not synchronized with an active IRQ.
+types::status register_rx_callback(bus bus, rx_callback callback);
+void unregister_rx_callbacks(bus bus);
+
+TX_SEMAPHORE* err_sem(bus bus);
 
 } // namespace bsp::can

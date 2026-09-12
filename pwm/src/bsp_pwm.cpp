@@ -1,296 +1,257 @@
 #include "bsp_pwm.hpp"
+#include "bsp_pwm_binding.hpp"
+#include "bsp_pwm_failsafe.hpp"
 
-// TIM1 的 attended PWM 驗證閉包：CH1/CH2/CH3/CH4 → PE9/PE11/PE13/PE14。
-// 四路共用同一 ARR（20ms / 50Hz）給同類舵機；MyCar 底盤不使用它作為馬達控制介面。
-// 手寫 HAL 初始化，不經 CubeMX；IOC 未占用 TIM1 與這四個腳位。
-
-#include "pwm_channels.hpp"
-#include "stm32f4xx_hal.h"
-
-#include <array>
 #include <cmath>
-#include <cstddef>
+#include <cstdint>
+#include <limits>
 
 namespace bsp::pwm
 {
 namespace
 {
 
-struct channel_binding
+constexpr std::uint64_t compare_for_duty(std::uint64_t period_ticks,
+                                         float duty_ratio) noexcept
 {
-    channel logical;
-    std::uint32_t timer_channel;
-    std::uint16_t gpio_pin;
-};
-
-// 邏輯通道 → TIM1 硬體通道 / GPIOE 腳位。
-constexpr std::array<channel_binding, board::pwm::servo_channel_count>
-    bindings{{
-        {board::pwm::servo_c2, TIM_CHANNEL_2, GPIO_PIN_11},
-        {board::pwm::servo_pe9, TIM_CHANNEL_1, GPIO_PIN_9},
-        {board::pwm::servo_pe13, TIM_CHANNEL_3, GPIO_PIN_13},
-        {board::pwm::servo_pe14, TIM_CHANNEL_4, GPIO_PIN_14},
-    }};
-
-constexpr std::uint32_t default_period_us = 20000U;
-
-TIM_HandleTypeDef timer{};
-bool initialized = false;
-
-// 週期由共用時基決定；started 是每通道獨立的 capture/compare 輸出狀態。
-std::uint32_t shared_period_us = default_period_us;
-std::array<bool, board::pwm::servo_channel_count> channel_started{};
-
-const channel_binding* binding_of(channel selected) noexcept
-{
-    for (const channel_binding& candidate : bindings)
-    {
-        if (candidate.logical == selected)
-        {
-            return &candidate;
-        }
-    }
-    return nullptr;
+    return static_cast<std::uint64_t>(duty_ratio * static_cast<double>(period_ticks));
 }
 
-std::size_t index_of(const channel_binding& binding) noexcept
+static_assert(compare_for_duty(2'000U, 0.0f) == 0U);
+static_assert(compare_for_duty(2'000U, 0.5f) == 1'000U);
+static_assert(compare_for_duty(2'000U, 1.0f) == 2'000U);
+
+const channel_config* config_of(channel channel_id) noexcept
 {
-    return static_cast<std::size_t>(&binding - bindings.data());
+    const auto index = static_cast<std::size_t>(channel_id);
+    return index < channel_count ? &configs[index] : nullptr;
 }
 
-std::uint16_t all_pins() noexcept
+types::status get_binding(channel channel_id, detail::binding& binding) noexcept
 {
-    std::uint16_t pins = 0U;
-    for (const channel_binding& candidate : bindings)
+    if (!is_enabled(channel_id))
     {
-        pins = static_cast<std::uint16_t>(pins | candidate.gpio_pin);
+        return types::status::invalid_arg;
     }
-    return pins;
-}
-
-bool any_channel_started() noexcept
-{
-    for (const bool started : channel_started)
+    if (!detail::binding_for(channel_id, binding) || binding.timer == nullptr ||
+        !IS_TIM_CHANNELS(binding.hal_channel))
     {
-        if (started)
-        {
-            return true;
-        }
+        return types::status::not_configured;
     }
-    return false;
-}
-
-std::uint32_t timer_clock_hz() noexcept
-{
-    const std::uint32_t pclk = HAL_RCC_GetPCLK2Freq();
-    return (RCC->CFGR & RCC_CFGR_PPRE2) == RCC_HCLK_DIV1
-               ? pclk
-               : pclk * 2U;
-}
-
-types::status ensure_initialized() noexcept
-{
-    if (initialized)
-    {
-        return types::status::ok;
-    }
-
-    const std::uint32_t clock_hz = timer_clock_hz();
-    if (clock_hz < 1000000U || (clock_hz % 1000000U) != 0U)
-    {
-        return types::status::error;
-    }
-
-    __HAL_RCC_GPIOE_CLK_ENABLE();
-    __HAL_RCC_TIM1_CLK_ENABLE();
-
-    GPIO_InitTypeDef gpio{};
-    gpio.Pin = all_pins();
-    gpio.Mode = GPIO_MODE_AF_PP;
-    gpio.Pull = GPIO_NOPULL;
-    gpio.Speed = GPIO_SPEED_FREQ_LOW;
-    gpio.Alternate = GPIO_AF1_TIM1;
-    HAL_GPIO_Init(GPIOE, &gpio);
-
-    timer.Instance = TIM1;
-    timer.Init.Prescaler = (clock_hz / 1000000U) - 1U;
-    timer.Init.CounterMode = TIM_COUNTERMODE_UP;
-    timer.Init.Period = shared_period_us - 1U;
-    timer.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-    timer.Init.RepetitionCounter = 0U;
-    timer.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-    if (HAL_TIM_PWM_Init(&timer) != HAL_OK)
-    {
-        return types::status::error;
-    }
-
-    // 全部通道以零脈寬配置，維持上電零輸出。
-    for (const channel_binding& candidate : bindings)
-    {
-        TIM_OC_InitTypeDef output{};
-        output.OCMode = TIM_OCMODE_PWM1;
-        output.Pulse = 0U;
-        output.OCPolarity = TIM_OCPOLARITY_HIGH;
-        output.OCNPolarity = TIM_OCNPOLARITY_HIGH;
-        output.OCFastMode = TIM_OCFAST_DISABLE;
-        output.OCIdleState = TIM_OCIDLESTATE_RESET;
-        output.OCNIdleState = TIM_OCNIDLESTATE_RESET;
-        if (HAL_TIM_PWM_ConfigChannel(
-                &timer, &output, candidate.timer_channel) != HAL_OK)
-        {
-            return types::status::error;
-        }
-    }
-
-    initialized = true;
     return types::status::ok;
+}
+
+types::status set_compare_with_failsafe(channel channel_id,
+                                        const detail::binding& binding,
+                                        std::uint32_t compare) noexcept
+{
+    const std::uint32_t interrupt_posture = __get_PRIMASK();
+    __disable_irq();
+
+    // Fail closed while replacing the active lease. A breakpoint anywhere in
+    // this sequence therefore leaves the output at zero or with a live lease.
+    __HAL_TIM_SET_COMPARE(binding.timer, binding.hal_channel, 0U);
+    failsafe::disarm(channel_id);
+
+    types::status status = types::status::ok;
+    if (compare != 0U)
+    {
+        status = failsafe::arm(channel_id);
+        if (status == types::status::ok)
+        {
+            __HAL_TIM_SET_COMPARE(binding.timer, binding.hal_channel, compare);
+        }
+    }
+
+    __DSB();
+    if (interrupt_posture == 0U)
+    {
+        __enable_irq();
+    }
+    return status;
+}
+
+bool timer_ticks_for_us(const channel_config& config,
+                        const TIM_HandleTypeDef& timer,
+                        std::uint32_t duration_us,
+                        std::uint64_t& ticks) noexcept
+{
+    const std::uint64_t divider = static_cast<std::uint64_t>(timer.Init.Prescaler) + 1U;
+    if (config.timer_clock_hz == 0U || divider == 0U)
+    {
+        return false;
+    }
+    const std::uint64_t timer_tick_hz =
+        static_cast<std::uint64_t>(config.timer_clock_hz) / divider;
+    if (timer_tick_hz == 0U ||
+        duration_us > std::numeric_limits<std::uint64_t>::max() / timer_tick_hz)
+    {
+        return false;
+    }
+    ticks = timer_tick_hz * duration_us / 1'000'000U;
+    return ticks != 0U || duration_us == 0U;
 }
 
 } // namespace
 
-bool is_enabled(channel selected) noexcept
+types::status init(channel channel_id)
 {
-    return binding_of(selected) != nullptr;
+    detail::binding binding{};
+    const types::status status = get_binding(channel_id, binding);
+    const channel_config* config = config_of(channel_id);
+    if (status != types::status::ok || config == nullptr || config->timer_clock_hz == 0U)
+    {
+        return status == types::status::ok ? types::status::not_configured : status;
+    }
+    return failsafe::enabled(channel_id) ? failsafe::init(channel_id) : types::status::ok;
 }
 
-types::status start(channel selected) noexcept
+types::status start(channel channel_id)
 {
-    const channel_binding* binding = binding_of(selected);
-    if (binding == nullptr)
+    detail::binding binding{};
+    const types::status status = get_binding(channel_id, binding);
+    if (status != types::status::ok)
     {
-        return types::status::not_configured;
-    }
-    if (ensure_initialized() != types::status::ok)
-    {
-        return types::status::error;
-    }
-    if (HAL_TIM_PWM_Start(&timer, binding->timer_channel) != HAL_OK)
-    {
-        return types::status::error;
-    }
-    channel_started[index_of(*binding)] = true;
-    return types::status::ok;
-}
-
-types::status stop(channel selected) noexcept
-{
-    const channel_binding* binding = binding_of(selected);
-    if (binding == nullptr)
-    {
-        return types::status::not_configured;
-    }
-    if (!initialized)
-    {
-        return types::status::ok;
+        return status;
     }
 
-    __HAL_TIM_SET_COMPARE(&timer, binding->timer_channel, 0U);
-    const HAL_StatusTypeDef result =
-        HAL_TIM_PWM_Stop(&timer, binding->timer_channel);
-    channel_started[index_of(*binding)] = false;
-
-    // 共用時基：只有最後一路停止時才釋放 TIM1 與腳位。
-    if (!any_channel_started())
+    if (failsafe::enabled(channel_id))
     {
-        (void)HAL_TIM_PWM_DeInit(&timer);
-        HAL_GPIO_DeInit(GPIOE, all_pins());
-        __HAL_RCC_TIM1_CLK_DISABLE();
-        initialized = false;
-        shared_period_us = default_period_us;
-    }
-    return result == HAL_OK ? types::status::ok
-                            : types::status::error;
-}
-
-types::status set_period_us(channel selected,
-                            std::uint32_t period_us) noexcept
-{
-    if (!is_enabled(selected))
-    {
-        return types::status::not_configured;
-    }
-    if (period_us == 0U || period_us > 65536U)
-    {
-        return types::status::invalid_arg;
-    }
-    if (ensure_initialized() != types::status::ok)
-    {
-        return types::status::error;
-    }
-
-    // Fail closed: shortening ARR must not leave any existing CCR above the
-    // new period, which would otherwise make that PWM output continuously
-    // active in PWM mode 1.
-    for (const channel_binding& candidate : bindings)
-    {
-        if (__HAL_TIM_GET_COMPARE(&timer, candidate.timer_channel) > period_us)
+        __HAL_TIM_SET_COMPARE(binding.timer, binding.hal_channel, 0U);
+        const types::status init_status = failsafe::init(channel_id);
+        if (init_status != types::status::ok)
         {
-            return types::status::invalid_arg;
+            return init_status;
+        }
+        failsafe::disarm(channel_id);
+    }
+
+    if (HAL_TIM_PWM_Start(binding.timer, binding.hal_channel) != HAL_OK)
+    {
+        return types::status::error;
+    }
+
+    if (failsafe::enabled(channel_id))
+    {
+        const std::uint32_t interrupt_posture = __get_PRIMASK();
+        __disable_irq();
+        __HAL_TIM_SET_COUNTER(binding.timer, 0U);
+        if (interrupt_posture == 0U)
+        {
+            __enable_irq();
         }
     }
-
-    // ARR 是 timer 層級資源：改一路的週期會套用到全部四路。
-    __HAL_TIM_SET_AUTORELOAD(&timer, period_us - 1U);
-    __HAL_TIM_SET_COUNTER(&timer, 0U);
-    shared_period_us = period_us;
     return types::status::ok;
 }
 
-types::status set_pulse_us(channel selected,
-                           std::uint32_t pulse_us) noexcept
+types::status stop(channel channel_id)
 {
-    const channel_binding* binding = binding_of(selected);
-    if (binding == nullptr)
+    detail::binding binding{};
+    const types::status status = get_binding(channel_id, binding);
+    if (status != types::status::ok)
     {
-        return types::status::not_configured;
+        return status;
     }
-    if (pulse_us > shared_period_us)
+    if (failsafe::enabled(channel_id))
+    {
+        const std::uint32_t interrupt_posture = __get_PRIMASK();
+        __disable_irq();
+        __HAL_TIM_SET_COMPARE(binding.timer, binding.hal_channel, 0U);
+        failsafe::disarm(channel_id);
+        if (interrupt_posture == 0U)
+        {
+            __enable_irq();
+        }
+    }
+    return HAL_TIM_PWM_Stop(binding.timer, binding.hal_channel) == HAL_OK
+               ? types::status::ok
+               : types::status::error;
+}
+
+types::status set_duty(channel channel_id, float duty_ratio)
+{
+    detail::binding binding{};
+    const types::status status = get_binding(channel_id, binding);
+    if (status != types::status::ok)
+    {
+        return status;
+    }
+    if (!std::isfinite(duty_ratio) || duty_ratio < 0.0f || duty_ratio > 1.0f)
     {
         return types::status::invalid_arg;
     }
-    if (ensure_initialized() != types::status::ok)
+    const std::uint64_t period_ticks =
+        static_cast<std::uint64_t>(__HAL_TIM_GET_AUTORELOAD(binding.timer)) + 1U;
+    const std::uint64_t compare = compare_for_duty(period_ticks, duty_ratio);
+    if (compare > std::numeric_limits<std::uint32_t>::max())
     {
-        return types::status::error;
+        return types::status::invalid_arg;
     }
-
-    __HAL_TIM_SET_COMPARE(&timer, binding->timer_channel, pulse_us);
+    const auto compare_value = static_cast<std::uint32_t>(compare);
+    if (failsafe::enabled(channel_id))
+    {
+        return set_compare_with_failsafe(channel_id, binding, compare_value);
+    }
+    __HAL_TIM_SET_COMPARE(binding.timer, binding.hal_channel, compare_value);
     return types::status::ok;
 }
 
-types::status set_duty(channel selected, float duty_ratio) noexcept
+types::status set_period_us(channel channel_id, std::uint32_t period_us)
 {
-    if (!is_enabled(selected))
+    detail::binding binding{};
+    const types::status status = get_binding(channel_id, binding);
+    const channel_config* config = config_of(channel_id);
+    if (status != types::status::ok || config == nullptr)
     {
-        return types::status::not_configured;
+        return status == types::status::ok ? types::status::not_configured : status;
     }
-    if (!std::isfinite(duty_ratio))
+    if (period_us == 0U)
     {
         return types::status::invalid_arg;
     }
-    if (duty_ratio < 0.0F)
+    std::uint64_t period_ticks = 0U;
+    if (!timer_ticks_for_us(*config, *binding.timer, period_us, period_ticks))
     {
-        duty_ratio = 0.0F;
+        return types::status::invalid_arg;
     }
-    else if (duty_ratio > 1.0F)
+    const std::uint64_t max_period_ticks =
+        IS_TIM_32B_COUNTER_INSTANCE(binding.timer->Instance) ? 0x1'0000'0000ULL
+                                                             : 0x1'0000ULL;
+    if (period_ticks == 0U || period_ticks > max_period_ticks)
     {
-        duty_ratio = 1.0F;
+        return types::status::invalid_arg;
     }
-    return set_pulse_us(
-        selected,
-        static_cast<std::uint32_t>(
-            duty_ratio * static_cast<float>(shared_period_us)));
+    __HAL_TIM_SET_AUTORELOAD(binding.timer, static_cast<std::uint32_t>(period_ticks - 1U));
+    return types::status::ok;
 }
 
-void set_period(channel selected, float period_s) noexcept
+types::status set_pulse_width_us(channel channel_id, std::uint32_t pulse_width_us)
 {
-    if (!is_enabled(selected) || !std::isfinite(period_s) ||
-        period_s <= 0.0F || period_s > 0.065536F)
+    detail::binding binding{};
+    const types::status status = get_binding(channel_id, binding);
+    const channel_config* config = config_of(channel_id);
+    if (status != types::status::ok || config == nullptr)
     {
-        return;
+        return status == types::status::ok ? types::status::not_configured : status;
     }
-    (void)set_period_us(
-        selected,
-        static_cast<std::uint32_t>(period_s * 1000000.0F));
+    std::uint64_t pulse_ticks = 0U;
+    if (!timer_ticks_for_us(*config, *binding.timer, pulse_width_us, pulse_ticks))
+    {
+        return types::status::invalid_arg;
+    }
+    const std::uint64_t period_ticks =
+        static_cast<std::uint64_t>(__HAL_TIM_GET_AUTORELOAD(binding.timer)) + 1U;
+    if (pulse_ticks > period_ticks)
+    {
+        return types::status::invalid_arg;
+    }
+    const auto compare_value = static_cast<std::uint32_t>(pulse_ticks);
+    if (failsafe::enabled(channel_id))
+    {
+        return set_compare_with_failsafe(channel_id, binding, compare_value);
+    }
+    __HAL_TIM_SET_COMPARE(binding.timer, binding.hal_channel, compare_value);
+    return types::status::ok;
 }
 
 } // namespace bsp::pwm

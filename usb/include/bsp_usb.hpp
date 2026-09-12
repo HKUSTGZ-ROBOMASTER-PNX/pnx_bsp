@@ -1,31 +1,34 @@
 #pragma once
 
 #include "config.hpp"
+#include "callback.hpp"
 #include "usertypes.hpp"
 
 #include <cstddef>
 #include <cstdint>
-#include <cstring>
+#include <type_traits>
 
 namespace bsp::usb
 {
 
-enum class link_state : uint8_t
+using rx_callback = core::callback<void(const uint8_t*, uint16_t)>;
+
+enum class tx_result_code : uint8_t
 {
-    uninitialized = 0,
-    initialized,
-    connected,
-    fault,
+    success = 0,
+    not_connected,
+    usb_error,
+    short_write,
 };
 
-struct capabilities
+struct tx_result
 {
-    bool device_mode = false;
-    bool high_speed = false;
-    bool supports_vbus_sense = false;
-    uint16_t max_packet_size = 0;
-    uint16_t max_transfer_size = 0;
-    uint8_t tx_queue_depth = 0;
+    uint16_t requested_len = 0;
+    uint16_t actual_len = 0;
+    uint32_t usb_status = 0;
+    tx_result_code code = tx_result_code::usb_error;
+
+    constexpr bool success() const noexcept { return code == tx_result_code::success; }
 };
 
 struct config
@@ -33,19 +36,14 @@ struct config
     uint8_t read_priority = static_cast<uint8_t>(params::usb::read_thread_priority);
     uint8_t write_priority = static_cast<uint8_t>(params::usb::write_thread_priority);
     uint32_t period_ticks = params::usb::period_ticks;
-    uint16_t min_rx_size = 1;
-    uint16_t max_tx_size = 64;
-    void (*on_rx)(const uint8_t* data, uint16_t len, void* user) = nullptr;
-    uint16_t (*fill_tx)(uint8_t* buf, uint16_t cap, void* user) = nullptr;
-    void (*on_tx_done)(uint16_t requested_len, uint16_t actual_len, uint32_t status, void* user) = nullptr;
-    void* user = nullptr;
+    // RX and TX-result callbacks run respectively in USB read/write ThreadX threads.
+    rx_callback on_rx_callback{};
+    core::callback<void(const tx_result&)> on_tx_result_callback{};
 };
 
 struct runtime_state
 {
-    bool initialized = false;
     bool connected = false;
-    link_state link = link_state::uninitialized;
     bool read_busy = false;
     bool write_busy = false;
     uint32_t last_read_status = 0;
@@ -54,120 +52,34 @@ struct runtime_state
     uint16_t last_write_requested = 0;
     uint16_t last_write_actual = 0;
     uint16_t pending_write_len = 0;
+    bool pending_write = false;
+    bool in_flight_write = false;
     uint32_t read_count = 0;
     uint32_t write_count = 0;
     uint32_t error_count = 0;
     uint32_t tx_wake_count = 0;
-    uint32_t fill_count = 0;
-    uint32_t rx_bytes = 0;
-    uint32_t tx_bytes = 0;
-    uint32_t tx_drop_count = 0;
-    uint32_t connect_count = 0;
-    uint32_t disconnect_count = 0;
-    uint8_t tx_queue_size = 0;
-    uint8_t tx_queue_high_water = 0;
+    tx_result last_tx_result{};
 };
 
-struct write_result
+// Creates the CDC I/O workers once; CubeMX startup calls the private USBX hook.
+// Controller startup is independent of this call. init(ok) does not mean enumerated.
+// Callback targets are borrowed and must outlive the workers. RX bytes are valid
+// only during the callback; copy them before retaining or forwarding asynchronously.
+types::status init(const config& cfg);
+bool connected();
+const runtime_state& state();
+
+// CDC is a byte stream: on_rx_callback receives arbitrary chunks, not complete packets.
+// try_send is thread-context only and copies the bytes before returning.
+// ok means queued, not delivered. One pending write is allowed in addition to
+// the in-flight write; its completion is reported on the USB write thread.
+types::status try_send(const uint8_t* data, std::size_t len);
+
+template <typename Packet>
+types::status try_send(const Packet& packet)
 {
-    types::status status = types::status::error;
-    uint16_t accepted = 0;
-};
-
-// Accepts the configuration, retains its callbacks/user context, creates the
-// required resources and schedules asynchronous controller startup. An `ok`
-// result does not mean the device has enumerated or that the transport is
-// connected/ready. Repeating init with the identical configuration is
-// idempotent; an incompatible configuration is rejected so callback ownership
-// cannot be replaced silently.
-//
-// Callbacks execute in implementation-owned thread context, never retain their
-// provided buffers beyond the call, and must remain bounded/non-blocking.
-// Disconnect may suppress completion for a retired transfer.
-types::status init(const config& cfg) noexcept;
-
-// Copies a complete transfer into a bounded two-entry queue. This API is for
-// thread context only; it never retains the caller's buffer. Calls made before
-// connected() becomes true, after disconnect, or while the bounded queue cannot
-// accept the transfer return an explicit non-ok status without waiting.
-write_result write(const uint8_t* data, std::size_t len) noexcept;
-
-// True only while the selected board's CDC transport is usable.
-bool connected() noexcept;
-runtime_state snapshot() noexcept;
-capabilities get_capabilities() noexcept;
-
-// Compatibility view for existing callers. New code should use snapshot() so
-// it never keeps a reference to mutable telemetry.
-const runtime_state& state() noexcept;
-
-namespace detail
-{
-
-template <typename Rx, typename Tx>
-struct typed_link_binding
-{
-    inline static void (*on_rx_fn)(const Rx&, void*) = nullptr;
-    inline static bool (*fill_tx_fn)(Tx&, void*) = nullptr;
-    inline static void (*on_tx_done_fn)(uint16_t, uint16_t, uint32_t, void*) = nullptr;
-    inline static void* user_ptr = nullptr;
-
-    static void on_rx_raw(const uint8_t* data, uint16_t len, void* /*user*/)
-    {
-        if (len < sizeof(Rx) || on_rx_fn == nullptr)
-        {
-            return;
-        }
-        on_rx_fn(*reinterpret_cast<const Rx*>(data), user_ptr);
-    }
-
-    static uint16_t fill_tx_raw(uint8_t* buf, uint16_t cap, void* /*user*/)
-    {
-        if (fill_tx_fn == nullptr || cap < sizeof(Tx))
-        {
-            return 0;
-        }
-        Tx packet{};
-        if (!fill_tx_fn(packet, user_ptr))
-        {
-            return 0;
-        }
-        std::memcpy(buf, &packet, sizeof(Tx));
-        return sizeof(Tx);
-    }
-
-    static void on_tx_done_raw(uint16_t requested_len, uint16_t actual_len, uint32_t status, void* /*user*/)
-    {
-        if (on_tx_done_fn != nullptr)
-        {
-            on_tx_done_fn(requested_len, actual_len, status, user_ptr);
-        }
-    }
-};
-
-} // namespace detail
-
-template <typename Rx, typename Tx>
-config make_config(void (*on_rx_typed)(const Rx&, void*), bool (*fill_tx_typed)(Tx&, void*),
-                   void (*on_tx_done_typed)(uint16_t, uint16_t, uint32_t, void*) = nullptr,
-                   void* user = nullptr)
-{
-    static_assert(sizeof(Rx) > 0, "Rx must be non-empty");
-    static_assert(sizeof(Tx) > 0, "Tx must be non-empty");
-
-    detail::typed_link_binding<Rx, Tx>::on_rx_fn = on_rx_typed;
-    detail::typed_link_binding<Rx, Tx>::fill_tx_fn = fill_tx_typed;
-    detail::typed_link_binding<Rx, Tx>::on_tx_done_fn = on_tx_done_typed;
-    detail::typed_link_binding<Rx, Tx>::user_ptr = user;
-
-    config cfg{};
-    cfg.min_rx_size = sizeof(Rx);
-    cfg.max_tx_size = sizeof(Tx);
-    cfg.user = user;
-    cfg.on_rx = detail::typed_link_binding<Rx, Tx>::on_rx_raw;
-    cfg.fill_tx = detail::typed_link_binding<Rx, Tx>::fill_tx_raw;
-    cfg.on_tx_done = detail::typed_link_binding<Rx, Tx>::on_tx_done_raw;
-    return cfg;
+    static_assert(std::is_trivially_copyable_v<Packet>, "USB packets must be trivially copyable");
+    return try_send(reinterpret_cast<const uint8_t*>(&packet), sizeof(Packet));
 }
 
 } // namespace bsp::usb
