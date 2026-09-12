@@ -1,6 +1,5 @@
 #pragma once
 
-#include "adc.h"
 #include "bsp_dma.hpp"
 #include "config.hpp"
 #include "usertypes.hpp"
@@ -34,22 +33,5 @@ types::status start_it(channel channel_id);
 types::status start_dma(channel channel_id, bsp::dma::buffer_view buffer);
 types::status stop_dma(channel channel_id);
 const conversion_state& state(channel channel_id) noexcept;
-void handle_conversion_complete(ADC_HandleTypeDef* handle) noexcept;
-void handle_error(ADC_HandleTypeDef* handle) noexcept;
 
 } // namespace bsp::adc
-
-namespace bsp::adc::detail
-{
-
-struct binding
-{
-    ADC_HandleTypeDef* adc = nullptr;
-    std::uint32_t hal_channel = 0;
-    std::uint32_t rank = 0;
-    std::uint32_t sampling_time = 0;
-};
-
-bool binding_for(channel channel_id, binding& out) noexcept;
-
-} // namespace bsp::adc::detail

@@ -1,4 +1,5 @@
 #include "bsp_usart.hpp"
+#include "bsp_usart_binding.hpp"
 
 #include "memory.h"
 
@@ -6,20 +7,11 @@
 #include <cstring>
 #include <limits>
 
-extern "C" {
-extern DMA_HandleTypeDef hdma_uart5_rx;
-extern DMA_HandleTypeDef hdma_uart7_rx;
-extern DMA_HandleTypeDef hdma_uart7_tx;
-extern DMA_HandleTypeDef hdma_usart1_rx;
-extern DMA_HandleTypeDef hdma_usart1_tx;
-extern DMA_HandleTypeDef hdma_usart10_rx;
-}
-
 namespace
 {
 
 constexpr uint16_t dma_tx_stage_size = 256;
-constexpr std::uintptr_t dcache_line_size = 32U;
+constexpr std::uintptr_t dcache_line_size = bsp::dma::cache_line_size;
 
 struct port_state
 {
@@ -65,7 +57,7 @@ std::uintptr_t align_up(std::uintptr_t value, std::uintptr_t alignment)
     return (value + alignment - 1U) & ~(alignment - 1U);
 }
 
-bool cache_range_in_owner(bsp::dma::buffer_view buffer, size_t offset, size_t len,
+[[maybe_unused]] bool cache_range_in_owner(bsp::dma::buffer_view buffer, size_t offset, size_t len,
                           std::uintptr_t& aligned_start, std::uintptr_t& aligned_end)
 {
     if (buffer.data() == nullptr || buffer.capacity() == 0U || offset > buffer.capacity() ||
@@ -222,53 +214,6 @@ const port_config* config_of(std::size_t index) noexcept
     return index < port_count ? &configs[index] : nullptr;
 }
 
-UART_HandleTypeDef* handle_from_id(handle_id id) noexcept
-{
-    switch (id)
-    {
-    case handle_id::uart5:
-        return &huart5;
-    case handle_id::uart7:
-        return &huart7;
-    case handle_id::usart1:
-        return &huart1;
-    case handle_id::usart10:
-        return &huart10;
-    default:
-        return nullptr;
-    }
-}
-
-DMA_HandleTypeDef* rx_dma_from_id(handle_id id) noexcept
-{
-    switch (id)
-    {
-    case handle_id::uart5:
-        return &hdma_uart5_rx;
-    case handle_id::uart7:
-        return &hdma_uart7_rx;
-    case handle_id::usart1:
-        return &hdma_usart1_rx;
-    case handle_id::usart10:
-        return &hdma_usart10_rx;
-    default:
-        return nullptr;
-    }
-}
-
-DMA_HandleTypeDef* tx_dma_from_id(handle_id id) noexcept
-{
-    switch (id)
-    {
-    case handle_id::uart7:
-        return &hdma_uart7_tx;
-    case handle_id::usart1:
-        return &hdma_usart1_tx;
-    default:
-        return nullptr;
-    }
-}
-
 void enable_dma_irq(DMA_HandleTypeDef* dma) noexcept
 {
     if (dma == nullptr)
@@ -285,7 +230,12 @@ void enable_dma_irq(DMA_HandleTypeDef* dma) noexcept
 UART_HandleTypeDef* handle_of(std::size_t index) noexcept
 {
     const port_config* cfg = config_of(index);
-    return cfg != nullptr && cfg->enabled ? handle_from_id(cfg->handle) : nullptr;
+    if (cfg == nullptr || !cfg->enabled)
+    {
+        return nullptr;
+    }
+    detail::binding binding{};
+    return detail::binding_for(index, binding) ? binding.uart : nullptr;
 }
 
 std::size_t index_of(UART_HandleTypeDef* handle) noexcept
@@ -315,13 +265,19 @@ void setup_dma(UART_HandleTypeDef* handle) noexcept
         return;
     }
 
+    detail::binding binding{};
+    if (!detail::binding_for(index, binding))
+    {
+        return;
+    }
+
     if (cfg->has_rx_dma)
     {
-        enable_dma_irq(rx_dma_from_id(cfg->handle));
+        enable_dma_irq(binding.rx_dma);
     }
     if (cfg->has_tx_dma)
     {
-        enable_dma_irq(tx_dma_from_id(cfg->handle));
+        enable_dma_irq(binding.tx_dma);
     }
 }
 
@@ -471,7 +427,7 @@ types::status init(port port, mode mode)
         setup_dma(handle);
     }
 
-    __HAL_UART_SEND_REQ(handle, UART_RXDATA_FLUSH_REQUEST);
+    __HAL_UART_FLUSH_DRREGISTER(handle);
     ctx->port_mode = mode;
     ctx->initialized = true;
     return types::status::ok;
@@ -642,7 +598,8 @@ types::status start_rx_to_idle(port port, bsp::dma::buffer_view buffer, rx_callb
         return types::status::invalid_arg;
     }
 
-    // 启动 DMA 前先发布接收 owner；HAL 一启用接收就可能到达 IDLE 中断。
+    // Publish the receive owner before enabling DMA because HAL may deliver an
+    // IDLE interrupt immediately after reception starts.
     const port_state previous = *ctx;
     ctx->rx_buffer = buffer;
     ctx->rx_position = 0;

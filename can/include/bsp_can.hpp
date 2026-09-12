@@ -1,12 +1,12 @@
 #pragma once
 
-#include "config.hpp"
 #include "callback.hpp"
-#include "fdcan.h"
+#include "config.hpp"
 #include "tx_api.h"
 #include "usertypes.hpp"
 
 #include <cstddef>
+#include <cstdint>
 
 namespace bsp::can
 {
@@ -21,29 +21,20 @@ struct rx_frame
     uint8_t data[64]{};
 };
 
-// Invoked from the FDCAN HAL interrupt path; it must not block.
+// Invoked from the CAN HAL interrupt path; it must not block.
 using rx_callback = core::callback<void(bus, const rx_frame&)>;
 
-FDCAN_HandleTypeDef* handle_of(bus b) noexcept;
-bus bus_of(FDCAN_HandleTypeDef* handle) noexcept;
 bool bus_enabled(std::size_t index) noexcept;
 bus_type configured_bus_type(std::size_t index) noexcept;
 id_type filter_id_type_of(std::size_t index) noexcept;
-
-void receive(FDCAN_HandleTypeDef* handle, uint32_t rx_fifo);
-void handle_error(FDCAN_HandleTypeDef* handle, uint32_t error_status_its);
 
 types::status init(bus bus);
 types::status restart(bus bus);
 types::status transmit(bus bus, uint32_t id, const uint8_t* data, uint16_t len);
 
-/**
- * 注册 CAN 接收回调。
- *
- * 上下文：在线程/启动阶段调用，且应早于该总线开始接收帧。
- * 回调运行在 FDCAN 中断路径，不能阻塞。回调对象为借用对象；注册期间
- * 不得销毁其目标。接收已启动后注册不会与 IRQ 同步。
- */
+// Register before starting reception. The borrowed callback target must remain
+// alive until it is unregistered. Callback execution occurs in CAN IRQ context
+// and must not block. Registration is not synchronized with an active IRQ.
 types::status register_rx_callback(bus bus, rx_callback callback);
 void unregister_rx_callbacks(bus bus);
 

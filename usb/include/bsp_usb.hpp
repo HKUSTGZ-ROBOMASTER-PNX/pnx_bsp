@@ -61,12 +61,18 @@ struct runtime_state
     tx_result last_tx_result{};
 };
 
+// Creates the CDC I/O workers once; CubeMX startup calls the private USBX hook.
+// Controller startup is independent of this call. init(ok) does not mean enumerated.
+// Callback targets are borrowed and must outlive the workers. RX bytes are valid
+// only during the callback; copy them before retaining or forwarding asynchronously.
 types::status init(const config& cfg);
 bool connected();
 const runtime_state& state();
 
 // CDC is a byte stream: on_rx_callback receives arbitrary chunks, not complete packets.
 // try_send is thread-context only and copies the bytes before returning.
+// ok means queued, not delivered. One pending write is allowed in addition to
+// the in-flight write; its completion is reported on the USB write thread.
 types::status try_send(const uint8_t* data, std::size_t len);
 
 template <typename Packet>

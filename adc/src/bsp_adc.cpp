@@ -1,4 +1,5 @@
 #include "bsp_adc.hpp"
+#include "bsp_adc_binding.hpp"
 
 #include <array>
 

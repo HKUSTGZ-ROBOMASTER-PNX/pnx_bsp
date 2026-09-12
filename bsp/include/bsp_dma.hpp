@@ -58,21 +58,7 @@ private:
     alignas(cache_line_size) uint8_t storage_[capacity_value]{};
 };
 
-static_assert(alignof(buffer<1U>) >= cache_line_size);
-static_assert(alignof(buffer<18U>) >= cache_line_size);
-static_assert(alignof(buffer<21U>) >= cache_line_size);
-static_assert(alignof(buffer<24U>) >= cache_line_size);
-static_assert(alignof(buffer<32U>) >= cache_line_size);
-static_assert(alignof(buffer<256U>) >= cache_line_size);
-static_assert(sizeof(buffer<1U>) % cache_line_size == 0U);
-static_assert(sizeof(buffer<18U>) % cache_line_size == 0U);
-static_assert(sizeof(buffer<21U>) % cache_line_size == 0U);
-static_assert(sizeof(buffer<24U>) % cache_line_size == 0U);
-static_assert(sizeof(buffer<32U>) % cache_line_size == 0U);
-static_assert(sizeof(buffer<256U>) % cache_line_size == 0U);
-static_assert(buffer<18U>::capacity() == 32U);
-static_assert(buffer<21U>::capacity() == 32U);
-static_assert(buffer<24U>::capacity() == 32U);
-static_assert(buffer<256U>::capacity() == 256U);
+static_assert(cache_line_size > 0U);
+static_assert((cache_line_size & (cache_line_size - 1U)) == 0U);
 
 } // namespace bsp::dma

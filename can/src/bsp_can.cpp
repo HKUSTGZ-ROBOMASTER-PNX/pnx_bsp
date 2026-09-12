@@ -1,4 +1,5 @@
 #include "bsp_can.hpp"
+#include "bsp_can_binding.hpp"
 #include "bsp_can_diag.hpp"
 
 #include <array>
@@ -16,27 +17,17 @@ const bus_config* config_of(std::size_t index) noexcept
     return index < bus_count ? &configs[index] : nullptr;
 }
 
-FDCAN_HandleTypeDef* handle_from_id(handle_id id) noexcept
-{
-    switch (id)
-    {
-    case handle_id::fdcan1:
-        return &hfdcan1;
-    case handle_id::fdcan2:
-        return &hfdcan2;
-    case handle_id::fdcan3:
-        return &hfdcan3;
-    default:
-        return nullptr;
-    }
-}
-
 } // namespace
 
 FDCAN_HandleTypeDef* handle_of(bus b) noexcept
 {
     const bus_config* cfg = config_of(static_cast<std::size_t>(b));
-    return cfg != nullptr && cfg->enabled ? handle_from_id(cfg->handle) : nullptr;
+    if (cfg == nullptr || !cfg->enabled)
+    {
+        return nullptr;
+    }
+    detail::binding binding{};
+    return detail::binding_for(b, binding) ? binding.can : nullptr;
 }
 
 bus bus_of(FDCAN_HandleTypeDef* handle) noexcept

@@ -1,4 +1,5 @@
 #include "bsp_spi.hpp"
+#include "bsp_spi_binding.hpp"
 
 #include <array>
 #include <limits>

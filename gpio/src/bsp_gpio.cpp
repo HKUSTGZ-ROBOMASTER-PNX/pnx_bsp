@@ -22,8 +22,12 @@ GPIO_TypeDef* port_from_id(port_id id) noexcept
 #if defined(GPIOI)
     case port_id::i: return GPIOI;
 #endif
+#if defined(GPIOJ)
     case port_id::j: return GPIOJ;
+#endif
+#if defined(GPIOK)
     case port_id::k: return GPIOK;
+#endif
     default: return nullptr;
     }
 }

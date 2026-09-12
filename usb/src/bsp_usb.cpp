@@ -2,7 +2,7 @@
 
 #include "bridge_usb.h"
 #include "memory.h"
-#include "stm32h7xx.h"
+#include "main.h"
 
 #include "ux_api.h"
 #include "ux_device_class_cdc_acm.h"
@@ -36,7 +36,7 @@ bool initialized = false;
 bool device_ready()
 {
     UX_SLAVE_CLASS_CDC_ACM* cdc = usb_cdc_handle();
-    if (cdc == UX_NULL)
+    if (cdc == UX_NULL || _ux_system_slave == UX_NULL)
     {
         return false;
     }
@@ -183,7 +183,7 @@ types::status init(const config& cfg)
     {
         return types::status::ok;
     }
-    if (!cfg.on_rx_callback && !cfg.on_tx_result_callback)
+    if ((!cfg.on_rx_callback && !cfg.on_tx_result_callback) || cfg.period_ticks == 0U)
     {
         return types::status::invalid_arg;
     }

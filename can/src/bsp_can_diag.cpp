@@ -1,4 +1,5 @@
 #include "bsp_can_diag.hpp"
+#include "bsp_can_binding.hpp"
 
 #include "bsp_can.hpp"
 #include "tx_api.h"
