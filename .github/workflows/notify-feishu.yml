@@ -4,7 +4,8 @@ on:
   # 只监听 main 分支的 push
   push:
     branches:
-      - main
+      - stm32h7
+      - stm32f4
 
   # 保留手动测试入口
   workflow_dispatch:
