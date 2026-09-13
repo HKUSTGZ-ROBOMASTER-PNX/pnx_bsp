@@ -1,0 +1,27 @@
+﻿name: BSP branch contract
+
+on:
+  push:
+    branches: [stm32h7, stm32f4]
+  pull_request:
+    branches: [stm32h7, stm32f4]
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - name: Check patch whitespace
+        run: git diff --check HEAD^ HEAD
+      - name: Check BSP family manifest
+        shell: bash
+        run: |
+          branch="${GITHUB_HEAD_REF:-${GITHUB_REF_NAME}}"
+          case "$branch" in
+            stm32h7) expected=stm32h7 ;;
+            stm32f4) expected=stm32f4 ;;
+            *) echo "Unsupported branch: $branch"; exit 1 ;;
+          esac
+          grep -Fq "set(PNX_BSP_FAMILY \"$expected\")" bsp/target.cmake
