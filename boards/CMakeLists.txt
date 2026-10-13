@@ -23,3 +23,4 @@ message(STATUS "Linker script: ${BOARD_LINKER_SCRIPT}")
 
 add_subdirectory("cubemx/${BOARD}")
 add_subdirectory(dsp)
+add_subdirectory(wrapper)
