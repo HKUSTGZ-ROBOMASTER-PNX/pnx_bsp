@@ -229,6 +229,13 @@ SECTIONS
   PROVIDE( __bss_start = __tbss_start );
   PROVIDE( __bss_size = __bss_end - __bss_start );
 
+  /* DMA1/2 cannot access DTCM. This NOLOAD section is not startup-cleared. */
+  .ram_d1_bss (NOLOAD) : ALIGN(32)
+  {
+    *(.ram_d1_bss .ram_d1_bss.*)
+    . = ALIGN(32);
+  } >RAM_D1
+
   /* User_heap_stack section, used to check that there is enough RAM left */
   ._user_heap_stack (NOLOAD) :
   {
