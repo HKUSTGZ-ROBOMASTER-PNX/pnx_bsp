@@ -1,1 +1,0 @@
-add_subdirectory(cmake/stm32cubemx)
