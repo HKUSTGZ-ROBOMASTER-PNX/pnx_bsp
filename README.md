@@ -104,8 +104,7 @@ void init_can()
 - `err_sem()` 提供错误信号量；bus-off 后由应用线程调用 `restart()` 恢复。
 - F407 请求 FD 配置返回 `not_configured`；选择当前实现不支持的实例返回 `invalid_arg`。
 
-F407 的 bus-off 通知需要 SCE 中断。目前 wrapper 补充了 CAN1/CAN2 的 SCE 使能和 IRQ 入口；
-在 CubeMX 启用并生成这些中断后，应移除 wrapper 中对应补丁，避免重复定义。
+F407 的 bus-off 通知需要 SCE 中断。CAN1/CAN2 的 SCE 使能、优先级和 IRQ 入口由 CubeMX 配置并生成。
 
 ## GPIO、PWM 与 DWT
 
