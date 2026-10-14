@@ -4,8 +4,8 @@
 
 namespace pnxtypes
 {
-    
-enum class status : uint8_t 
+
+enum class status : uint8_t
 {
     ok = 0,
     error,

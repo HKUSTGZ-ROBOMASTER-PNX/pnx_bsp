@@ -10,15 +10,13 @@
 
 namespace msg
 {
-    
+
 inline constexpr uint8_t max_subscribers = 8U;
 inline constexpr uint8_t invalid_index = UINT8_MAX;
 
-template <typename T>
-class subscriber;
+template <typename T> class subscriber;
 
-template <typename T>
-class topic final 
+template <typename T> class topic final
 {
     static_assert(std::is_trivially_copyable_v<T>);
 
@@ -32,7 +30,6 @@ class topic final
     };
 
 public:
-
     topic() noexcept = default;
     topic(const topic&) = delete;
     topic& operator=(const topic&) = delete;
@@ -41,10 +38,14 @@ public:
     pnxtypes::status init() noexcept
     {
         if (initialized_)
+        {
             return pnxtypes::status::ok;
-        
+        }
+
         if (tx_mutex_create(&mutex_, const_cast<CHAR*>("msg"), TX_INHERIT) != TX_SUCCESS)
+        {
             return pnxtypes::status::error;
+        }
 
         initialized_ = true;
         return pnxtypes::status::ok;
@@ -54,16 +55,22 @@ public:
     pnxtypes::status deinit() noexcept
     {
         if (!initialized_)
+        {
             return pnxtypes::status::invalid_arg;
+        }
 
         if (tx_mutex_delete(&mutex_) != TX_SUCCESS)
+        {
             return pnxtypes::status::error;
+        }
 
         initialized_ = false;
         subcount_ = 0;
 
         for (auto& sub : subscribers_)
+        {
             sub = {};
+        }
 
         return pnxtypes::status::ok;
     }
@@ -72,10 +79,14 @@ public:
     subscriber<T> subscribe() noexcept
     {
         if (!initialized_)
+        {
             return {};
+        }
 
         if (tx_mutex_get(&mutex_, TX_NO_WAIT) != TX_SUCCESS)
+        {
             return {};
+        }
 
         uint8_t index = invalid_index;
 
@@ -88,7 +99,9 @@ public:
         tx_mutex_put(&mutex_);
 
         if (index == invalid_index)
+        {
             return {};
+        }
 
         return subscriber<T>{this, index};
     }
@@ -97,15 +110,21 @@ public:
     pnxtypes::status publish(const T& data) noexcept
     {
         if (!initialized_)
+        {
             return pnxtypes::status::invalid_arg;
+        }
 
         if (tx_mutex_get(&mutex_, TX_NO_WAIT) != TX_SUCCESS)
+        {
             return pnxtypes::status::busy;
+        }
 
         data_ = data;
 
         for (uint8_t i = 0; i < subcount_; ++i)
+        {
             subscribers_[i].pending = true;
+        }
 
         tx_mutex_put(&mutex_);
 
@@ -113,15 +132,18 @@ public:
     }
 
 private:
-    
     // Check if the subscriber has a pending message
     [[nodiscard]] bool available(uint8_t index) noexcept
     {
         if (!initialized_ || index >= subcount_)
+        {
             return false;
+        }
 
         if (tx_mutex_get(&mutex_, TX_NO_WAIT) != TX_SUCCESS)
+        {
             return false;
+        }
 
         const bool pending = subscribers_[index].active && subscribers_[index].pending;
 
@@ -134,10 +156,14 @@ private:
     pnxtypes::status read(uint8_t index, T& output) noexcept
     {
         if (!initialized_ || index >= subcount_)
+        {
             return pnxtypes::status::invalid_arg;
+        }
 
         if (tx_mutex_get(&mutex_, TX_NO_WAIT) != TX_SUCCESS)
+        {
             return pnxtypes::status::busy;
+        }
 
         auto& sub = subscribers_[index];
 
@@ -164,9 +190,7 @@ private:
     bool initialized_ = false;
 };
 
-
-template <typename T>
-class subscriber
+template <typename T> class subscriber
 {
     friend class topic<T>;
 
@@ -186,7 +210,9 @@ public:
     [[nodiscard]] bool available() const noexcept
     {
         if (!valid())
+        {
             return false;
+        }
 
         return owner_->available(index_);
     }
@@ -194,14 +220,15 @@ public:
     pnxtypes::status read(T& output) noexcept
     {
         if (!valid())
+        {
             return pnxtypes::status::invalid_arg;
+        }
 
         return owner_->read(index_, output);
     }
 
 private:
-    subscriber(topic<T>* owner, uint8_t index) noexcept
-        : owner_(owner), index_(index)
+    subscriber(topic<T>* owner, uint8_t index) noexcept : owner_(owner), index_(index)
     {
     }
 

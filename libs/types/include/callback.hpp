@@ -1,4 +1,4 @@
-#pragma once 
+#pragma once
 
 #include <functional>
 #include <type_traits>
@@ -7,44 +7,37 @@
 namespace pnxtypes
 {
 
-template <typename Signature>
-class callback;
+template <typename Signature> class callback;
 
-template <typename Result, typename... Args>
-class callback<Result(Args...)>
+template <typename Result, typename... Args> class callback<Result(Args...)>
 {
 public:
     using entry_type = Result (*)(void*, Args...);
 
     constexpr callback() noexcept = default;
 
-    template <auto Function>
-    static constexpr callback bind() noexcept
+    template <auto Function> static constexpr callback bind() noexcept
     {
         static_assert(std::is_invocable_r_v<Result, decltype(Function), Args...>);
 
         return {nullptr, [](void*, Args... args) -> Result
-        {
-            return std::invoke(Function, std::forward<Args>(args)...);
-        }};
+                {
+                    return std::invoke(Function, std::forward<Args>(args)...);
+                }};
     }
 
-    template <auto Method, typename Object>
-    static constexpr callback bind(Object* object) noexcept
+    template <auto Method, typename Object> static constexpr callback bind(Object* object) noexcept
     {
         static_assert(std::is_member_function_pointer_v<decltype(Method)>);
         static_assert(std::is_invocable_r_v<Result, decltype(Method), Object&, Args...>);
 
-        return object ? callback{const_cast<void*>(
-            static_cast<const void*>(object)),
-            [](void* context, Args... args) -> Result
-            {
-                return std::invoke(
-                    Method,
-                    *static_cast<Object*>(context),
-                    std::forward<Args>(args)...
-                );
-            }} : callback{};
+        return object ? callback{const_cast<void*>(static_cast<const void*>(object)),
+                                 [](void* context, Args... args) -> Result
+                                 {
+                                     return std::invoke(Method, *static_cast<Object*>(context),
+                                                        std::forward<Args>(args)...);
+                                 }}
+                      : callback{};
     }
 
     [[nodiscard]] constexpr bool valid() const noexcept
@@ -73,8 +66,7 @@ public:
     }
 
 private:
-    constexpr callback(void* context, entry_type entry) noexcept
-        : context_(context), entry_(entry)
+    constexpr callback(void* context, entry_type entry) noexcept : context_(context), entry_(entry)
     {
     }
 

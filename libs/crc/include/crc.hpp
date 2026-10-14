@@ -2,15 +2,14 @@
 
 #include "stdint.h"
 
-namespace crc 
+namespace crc
 {
 
 inline constexpr uint16_t CRC16Init = 0xFFFFU;
 inline constexpr uint16_t CRC16ModbusInit = 0xFFFFU;
 inline constexpr uint8_t CRC8Init = 0xFFU;
 
-inline constexpr uint16_t CRC16Table[256] = 
-{
+inline constexpr uint16_t CRC16Table[256] = {
     0x0000, 0x1189, 0x2312, 0x329b, 0x4624, 0x57ad, 0x6536, 0x74bf, 0x8c48, 0x9dc1, 0xaf5a, 0xbed3,
     0xca6c, 0xdbe5, 0xe97e, 0xf8f7, 0x1081, 0x0108, 0x3393, 0x221a, 0x56a5, 0x472c, 0x75b7, 0x643e,
     0x9cc9, 0x8d40, 0xbfdb, 0xae52, 0xdaed, 0xcb64, 0xf9ff, 0xe876, 0x2102, 0x308b, 0x0210, 0x1399,
@@ -32,11 +31,9 @@ inline constexpr uint16_t CRC16Table[256] =
     0x5ac5, 0x4b4c, 0x79d7, 0x685e, 0x1ce1, 0x0d68, 0x3ff3, 0x2e7a, 0xe70e, 0xf687, 0xc41c, 0xd595,
     0xa12a, 0xb0a3, 0x8238, 0x93b1, 0x6b46, 0x7acf, 0x4854, 0x59dd, 0x2d62, 0x3ceb, 0x0e70, 0x1ff9,
     0xf78f, 0xe606, 0xd49d, 0xc514, 0xb1ab, 0xa022, 0x92b9, 0x8330, 0x7bc7, 0x6a4e, 0x58d5, 0x495c,
-    0x3de3, 0x2c6a, 0x1ef1, 0x0f78
-};
+    0x3de3, 0x2c6a, 0x1ef1, 0x0f78};
 
-inline constexpr uint8_t CRC8Table[256] = 
-{
+inline constexpr uint8_t CRC8Table[256] = {
     0x00, 0x5e, 0xbc, 0xe2, 0x61, 0x3f, 0xdd, 0x83, 0xc2, 0x9c, 0x7e, 0x20, 0xa3, 0xfd, 0x1f, 0x41,
     0x9d, 0xc3, 0x21, 0x7f, 0xfc, 0xa2, 0x40, 0x1e, 0x5f, 0x01, 0xe3, 0xbd, 0x3e, 0x60, 0x82, 0xdc,
     0x23, 0x7d, 0x9f, 0xc1, 0x42, 0x1c, 0xfe, 0xa0, 0xe1, 0xbf, 0x5d, 0x03, 0x80, 0xde, 0x3c, 0x62,
@@ -52,50 +49,49 @@ inline constexpr uint8_t CRC8Table[256] =
     0xca, 0x94, 0x76, 0x28, 0xab, 0xf5, 0x17, 0x49, 0x08, 0x56, 0xb4, 0xea, 0x69, 0x37, 0xd5, 0x8b,
     0x57, 0x09, 0xeb, 0xb5, 0x36, 0x68, 0x8a, 0xd4, 0x95, 0xcb, 0x29, 0x77, 0xf4, 0xaa, 0x48, 0x16,
     0xe9, 0xb7, 0x55, 0x0b, 0x88, 0xd6, 0x34, 0x6a, 0x2b, 0x75, 0x97, 0xc9, 0x4a, 0x14, 0xf6, 0xa8,
-    0x74, 0x2a, 0xc8, 0x96, 0x15, 0x4b, 0xa9, 0xf7, 0xb6, 0xe8, 0x0a, 0x54, 0xd7, 0x89, 0x6b, 0x35
-};
+    0x74, 0x2a, 0xc8, 0x96, 0x15, 0x4b, 0xa9, 0xf7, 0xb6, 0xe8, 0x0a, 0x54, 0xd7, 0x89, 0x6b, 0x35};
 
-inline uint16_t get_crc16_checksum(const uint8_t* _data, uint32_t length, uint16_t seed) 
+inline uint16_t get_crc16_checksum(const uint8_t* _data, uint32_t length, uint16_t seed)
 {
-  if (_data == nullptr) 
-  {
-    return 0xFFFFU;
-  }
+    if (_data == nullptr)
+    {
+        return 0xFFFFU;
+    }
 
-  uint16_t crc = seed;
-  while (length-- > 0U) 
-  {
-    const uint8_t byte = *_data++;
-    crc = static_cast<uint16_t>((crc >> 8) ^
-                                CRC16Table[(crc ^ static_cast<uint16_t>(byte)) & 0x00FFU]);
-  }
-  return crc;
+    uint16_t crc = seed;
+    while (length-- > 0U)
+    {
+        const uint8_t byte = *_data++;
+        crc = static_cast<uint16_t>((crc >> 8) ^
+                                    CRC16Table[(crc ^ static_cast<uint16_t>(byte)) & 0x00FFU]);
+    }
+    return crc;
 }
 
-inline uint32_t verify_crc16_checksum(const uint8_t* _data, uint32_t length) 
+inline uint32_t verify_crc16_checksum(const uint8_t* _data, uint32_t length)
 {
-  if (_data == nullptr || length <= 2U) 
-  {
-    return 0U;
-  }
+    if (_data == nullptr || length <= 2U)
+    {
+        return 0U;
+    }
 
-  const uint16_t expected = get_crc16_checksum(_data, length - 2U, CRC16Init);
-  return (static_cast<uint8_t>(expected & 0xFFU) == _data[length - 2U] &&
-          static_cast<uint8_t>((expected >> 8) & 0xFFU) == _data[length - 1U])
-             ? 1U
-             : 0U;
+    const uint16_t expected = get_crc16_checksum(_data, length - 2U, CRC16Init);
+    return (static_cast<uint8_t>(expected & 0xFFU) == _data[length - 2U] &&
+            static_cast<uint8_t>((expected >> 8) & 0xFFU) == _data[length - 1U])
+               ? 1U
+               : 0U;
 }
 
-inline void append_crc16_checksum(uint8_t* _data, uint32_t length) 
+inline void append_crc16_checksum(uint8_t* _data, uint32_t length)
 {
-  if (_data == nullptr || length <= 2U) 
-  {
-    return;
-  }
+    if (_data == nullptr || length <= 2U)
+    {
+        return;
+    }
 
-  const uint16_t crc = get_crc16_checksum(_data, length - 2U, CRC16Init);
-  _data[length - 2U] = static_cast<uint8_t>(crc & 0x00FFU);
-  _data[length - 1U] = static_cast<uint8_t>((crc >> 8) & 0x00FFU);
+    const uint16_t crc = get_crc16_checksum(_data, length - 2U, CRC16Init);
+    _data[length - 2U] = static_cast<uint8_t>(crc & 0x00FFU);
+    _data[length - 1U] = static_cast<uint8_t>((crc >> 8) & 0x00FFU);
 }
 
 // Modbus CRC16
@@ -105,88 +101,86 @@ inline void append_crc16_checksum(uint8_t* _data, uint32_t length)
 // CRC output bytes: low byte first
 inline uint16_t get_crc16_modbus_checksum(const uint8_t* _data, uint32_t length, uint16_t seed)
 {
-  if (_data == nullptr)
-  {
-    return 0xFFFFU;
-  }
-
-  uint16_t crc = seed;
-  while (length-- > 0U)
-  {
-    crc = static_cast<uint16_t>(crc ^ static_cast<uint16_t>(*_data++));
-    for (uint8_t bit = 0U; bit < 8U; ++bit)
+    if (_data == nullptr)
     {
-      if ((crc & 0x0001U) != 0U)
-      {
-        crc = static_cast<uint16_t>((crc >> 1U) ^ 0xA001U);
-      }
-      else
-      {
-        crc = static_cast<uint16_t>(crc >> 1U);
-      }
+        return 0xFFFFU;
     }
-  }
-  return crc;
+
+    uint16_t crc = seed;
+    while (length-- > 0U)
+    {
+        crc = static_cast<uint16_t>(crc ^ static_cast<uint16_t>(*_data++));
+        for (uint8_t bit = 0U; bit < 8U; ++bit)
+        {
+            if ((crc & 0x0001U) != 0U)
+            {
+                crc = static_cast<uint16_t>((crc >> 1U) ^ 0xA001U);
+            }
+            else
+            {
+                crc = static_cast<uint16_t>(crc >> 1U);
+            }
+        }
+    }
+    return crc;
 }
 
 inline uint32_t verify_crc16_modbus_checksum(const uint8_t* _data, uint32_t length)
 {
-  if (_data == nullptr || length <= 2U)
-  {
-    return 0U;
-  }
+    if (_data == nullptr || length <= 2U)
+    {
+        return 0U;
+    }
 
-  const uint16_t expected =
-      get_crc16_modbus_checksum(_data, length - 2U, CRC16ModbusInit);
-  return (static_cast<uint8_t>(expected & 0x00FFU) == _data[length - 2U] &&
-          static_cast<uint8_t>((expected >> 8U) & 0x00FFU) == _data[length - 1U])
-             ? 1U
-             : 0U;
+    const uint16_t expected = get_crc16_modbus_checksum(_data, length - 2U, CRC16ModbusInit);
+    return (static_cast<uint8_t>(expected & 0x00FFU) == _data[length - 2U] &&
+            static_cast<uint8_t>((expected >> 8U) & 0x00FFU) == _data[length - 1U])
+               ? 1U
+               : 0U;
 }
 
 inline void append_crc16_modbus_checksum(uint8_t* _data, uint32_t length)
 {
-  if (_data == nullptr || length <= 2U)
-  {
-    return;
-  }
+    if (_data == nullptr || length <= 2U)
+    {
+        return;
+    }
 
-  const uint16_t crc = get_crc16_modbus_checksum(_data, length - 2U, CRC16ModbusInit);
-  _data[length - 2U] = static_cast<uint8_t>(crc & 0x00FFU);
-  _data[length - 1U] = static_cast<uint8_t>((crc >> 8U) & 0x00FFU);
+    const uint16_t crc = get_crc16_modbus_checksum(_data, length - 2U, CRC16ModbusInit);
+    _data[length - 2U] = static_cast<uint8_t>(crc & 0x00FFU);
+    _data[length - 1U] = static_cast<uint8_t>((crc >> 8U) & 0x00FFU);
 }
 
-inline uint8_t get_crc8_checksum(const uint8_t* _data, uint16_t length, uint8_t seed) 
+inline uint8_t get_crc8_checksum(const uint8_t* _data, uint16_t length, uint8_t seed)
 {
-  uint8_t crc = seed;
-  while (length-- > 0U) 
-  {
-    const uint8_t index = static_cast<uint8_t>(crc ^ *_data++);
-    crc = CRC8Table[index];
-  }
-  return crc;
+    uint8_t crc = seed;
+    while (length-- > 0U)
+    {
+        const uint8_t index = static_cast<uint8_t>(crc ^ *_data++);
+        crc = CRC8Table[index];
+    }
+    return crc;
 }
 
-inline uint32_t verify_crc8_checksum(const uint8_t* _data, uint16_t length) 
+inline uint32_t verify_crc8_checksum(const uint8_t* _data, uint16_t length)
 {
-  if (_data == nullptr || length <= 2U) {
-    return 0U;
-  }
+    if (_data == nullptr || length <= 2U)
+    {
+        return 0U;
+    }
 
-  const uint8_t expected = get_crc8_checksum(_data, static_cast<uint16_t>(length - 1U), CRC8Init);
-  return expected == _data[length - 1U] ? 1U : 0U;
+    const uint8_t expected = get_crc8_checksum(_data, static_cast<uint16_t>(length - 1U), CRC8Init);
+    return expected == _data[length - 1U] ? 1U : 0U;
 }
 
-inline void append_crc8_checksum(uint8_t* _data, uint16_t length) 
+inline void append_crc8_checksum(uint8_t* _data, uint16_t length)
 {
-  if (_data == nullptr || length <= 2U) 
-  {
-    return;
-  }
+    if (_data == nullptr || length <= 2U)
+    {
+        return;
+    }
 
-  _data[length - 1U] =
-      get_crc8_checksum(_data, static_cast<uint16_t>(length - 1U), CRC8Init);
+    _data[length - 1U] = get_crc8_checksum(_data, static_cast<uint16_t>(length - 1U), CRC8Init);
 }
 
-}  // namespace crc
-
+} // namespace crc

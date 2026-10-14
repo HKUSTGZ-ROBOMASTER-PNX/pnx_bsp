@@ -12,3 +12,8 @@ target_include_directories(libs INTERFACE
 
 # boards supplies the selected board's ThreadX headers and configuration.
 target_link_libraries(libs INTERFACE stm32cubemx)
+
+file(GLOB_RECURSE _libs_headers CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/*/include/*.hpp"
+)
+target_sources(libs INTERFACE ${_libs_headers})

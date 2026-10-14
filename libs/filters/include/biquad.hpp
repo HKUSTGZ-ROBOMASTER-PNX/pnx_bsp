@@ -26,13 +26,19 @@ struct biquad
     float b0 = 1, b1 = 0, b2 = 0, a1 = 0, a2 = 0;
     biquad_state state{};
 
-    float update(float input) { return state.update(input, b0, b1, b2, a1, a2); }
+    float update(float input)
+    {
+        return state.update(input, b0, b1, b2, a1, a2);
+    }
 
     // Second-order Butterworth high pass. Nonpositive frequencies select bypass.
     static biquad high_pass(float cutoff_hz, float sample_rate_hz)
     {
         biquad result{};
-        if (cutoff_hz <= 0 || sample_rate_hz <= 0) return result;
+        if (cutoff_hz <= 0 || sample_rate_hz <= 0)
+        {
+            return result;
+        }
         const float k = tanf(math::pi * cutoff_hz / sample_rate_hz);
         constexpr float sqrt2 = 1.41421356237f;
         const float norm = 1.0f / (1.0f + sqrt2 * k + k * k);

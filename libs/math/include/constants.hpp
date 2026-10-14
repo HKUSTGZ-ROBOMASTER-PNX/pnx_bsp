@@ -9,8 +9,15 @@ namespace math
 inline constexpr float pi = 3.14159265358979f;
 inline constexpr float two_pi = 6.283185307f;
 
-inline constexpr float degrees_to_radians(float degrees) { return degrees * (pi / 180.0f); }
-inline constexpr float radians_to_degrees(float radians) { return radians * (180.0f / pi); }
+inline constexpr float degrees_to_radians(float degrees)
+{
+    return degrees * (pi / 180.0f);
+}
+
+inline constexpr float radians_to_degrees(float radians)
+{
+    return radians * (180.0f / pi);
+}
 
 inline float inv_sqrt(float value)
 {
