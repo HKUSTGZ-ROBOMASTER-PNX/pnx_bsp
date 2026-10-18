@@ -65,6 +65,21 @@ inline status stop(handle timer, channel output) noexcept
         HAL_TIM_PWM_Stop(peripherals::tim_handle(timer), peripherals::pwm_channel(timer, output)));
 }
 
+// Non-blocking emergency gate for a normal PWM output, including timer/IRQ context.
+// Does not update HAL channel state; the owner must call stop() before restarting.
+inline status disable_output(handle timer, channel output) noexcept
+{
+    if (auto checked = ready(timer, output); checked != status::ok)
+    {
+        return checked;
+    }
+    auto* native = peripherals::tim_handle(timer);
+    const auto channel = peripherals::pwm_channel(timer, output);
+    CLEAR_BIT(native->Instance->CCER, TIM_CCER_CC1E << channel);
+    __HAL_TIM_SET_COMPARE(native, channel, 0U);
+    return status::ok;
+}
+
 inline status set_duty(handle timer, channel output, float ratio) noexcept
 {
     if (auto checked = ready(timer, output); checked != status::ok)
@@ -83,7 +98,7 @@ inline status set_duty(handle timer, channel output, float ratio) noexcept
         return status::invalid_arg;
     }
     __HAL_TIM_SET_COMPARE(native, peripherals::pwm_channel(timer, output),
-                          static_cast<uint32_t>(compare));
+        static_cast<uint32_t>(compare));
     return status::ok;
 }
 
@@ -124,7 +139,7 @@ inline status set_pulse_width_us(const config& timer, channel output, uint32_t p
         return status::invalid_arg;
     }
     __HAL_TIM_SET_COMPARE(native, peripherals::pwm_channel(timer.instance, output),
-                          static_cast<uint32_t>(count));
+        static_cast<uint32_t>(count));
     return status::ok;
 }
 } // namespace bsp::pwm
