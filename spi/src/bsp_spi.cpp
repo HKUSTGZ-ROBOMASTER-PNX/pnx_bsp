@@ -214,6 +214,27 @@ status receive_it(handle instance, uint8_t* data, uint32_t size) noexcept
                                                 static_cast<uint16_t>(size)));
 }
 
+status transmit_receive_it(handle instance, const uint8_t* tx, uint8_t* rx,
+    uint32_t size) noexcept
+{
+    if (tx == nullptr || rx == nullptr)
+    {
+        return status::invalid_arg;
+    }
+    if (auto result = ready(instance, size, true); result != status::ok)
+    {
+        return result;
+    }
+    auto* native = peripherals::spi_handle(instance);
+    if (native->Init.Direction != SPI_DIRECTION_2LINES)
+    {
+        return status::not_configured;
+    }
+    begin(contexts[index(instance)], true, false);
+    return started(instance, HAL_SPI_TransmitReceive_IT(native, const_cast<uint8_t*>(tx), rx,
+        static_cast<uint16_t>(size)));
+}
+
 status transmit_dma(handle instance, const uint8_t* data, uint32_t size, uint32_t capacity) noexcept
 {
     if (auto result = prepare_dma(instance, false, data, size, capacity); result != status::ok)
@@ -237,6 +258,42 @@ status receive_dma(handle instance, uint8_t* data, uint32_t size, uint32_t capac
     begin(contexts[index(instance)], true, true, data, capacity);
     return started(instance, HAL_SPI_Receive_DMA(peripherals::spi_handle(instance), data,
                                                  static_cast<uint16_t>(size)));
+}
+
+status transmit_receive_dma(handle instance, const uint8_t* tx, uint8_t* rx,
+    uint32_t size, uint32_t tx_capacity, uint32_t rx_capacity) noexcept
+{
+    if (auto result = prepare_dma(instance, false, tx, size, tx_capacity); result != status::ok)
+    {
+        return result;
+    }
+    if (auto result = prepare_dma(instance, true, rx, size, rx_capacity); result != status::ok)
+    {
+        return result;
+    }
+#if defined(STM32H723xx)
+    // H7 DMA completion enables EOT; F4 completes from the DMA callback alone.
+    if (!peripherals::spi_configs[index(instance)].irq)
+    {
+        return status::not_configured;
+    }
+#endif
+    auto* native = peripherals::spi_handle(instance);
+    if (native->Init.Direction != SPI_DIRECTION_2LINES)
+    {
+        return status::not_configured;
+    }
+    const auto tx_start = reinterpret_cast<uintptr_t>(tx);
+    const auto rx_start = reinterpret_cast<uintptr_t>(rx);
+    if (tx_start < rx_start + rx_capacity && rx_start < tx_start + tx_capacity)
+    {
+        return status::invalid_arg;
+    }
+    bsp::clean_cache(tx, tx_capacity);
+    bsp::prepare_rx_cache(rx, rx_capacity);
+    begin(contexts[index(instance)], true, true, rx, rx_capacity);
+    return started(instance, HAL_SPI_TransmitReceive_DMA(native, const_cast<uint8_t*>(tx), rx,
+        static_cast<uint16_t>(size)));
 }
 
 status abort(handle instance) noexcept

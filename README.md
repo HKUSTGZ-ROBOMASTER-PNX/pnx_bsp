@@ -30,7 +30,7 @@ USBX/App/ux_device_cdc_acm.c
 | 模块 | 主要功能 | 使用前准备 |
 | --- | --- | --- |
 | [ADC](adc/include/bsp_adc.hpp) | 轮询、中断、DMA、校准和转换状态 | CubeMX 初始化后调用 `init(config)`；当前板级配置仅 H723 启用 ADC |
-| [SPI](spi/include/bsp_spi.hpp) | 阻塞收发、中断或 DMA 单向传输、状态与中止 | CubeMX 初始化，无额外 BSP `init()` |
+| [SPI](spi/include/bsp_spi.hpp) | 阻塞、中断或 DMA 的单向及全双工传输、状态与中止 | CubeMX 初始化，无额外 BSP `init()` |
 | [USART](usart/include/bsp_usart.hpp) | 阻塞或 DMA 发送、线路配置、接收到空闲 | `init(config, mode)` |
 | [CAN](can/include/bsp_can.hpp) | 经典 CAN、CAN FD、接收回调、错误通知 | 注册回调后调用 `init(config)` 或 `init(fd_config)` |
 | [GPIO](gpio/include/bsp_gpio.hpp) | 电平读写、有效态与翻转 | CubeMX 配置引脚；header-only |
