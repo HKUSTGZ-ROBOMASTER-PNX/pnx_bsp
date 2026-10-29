@@ -1,300 +1,291 @@
+#include "bsp.hpp"
 #include "bsp_adc.hpp"
+#include "peripherals.hpp"
 
-#include <array>
+#if defined(HAL_ADC_MODULE_ENABLED)
+#include <cstring>
 
 namespace bsp::adc
 {
-namespace
-{
 
-std::array<conversion_state, channel_count> conversion_states{};
-std::array<bsp::dma::buffer_view, channel_count> dma_buffers{};
-
-types::status get_binding(channel channel_id, detail::binding& binding) noexcept
+using pnxtypes::status;
+static conversion_state current{};
+static bool initialized = false;
+enum class operation
 {
-    if (!is_enabled(channel_id))
+    idle,
+    polling,
+    interrupt,
+    dma
+};
+static volatile operation active = operation::idle;
+static uint8_t* dma_data = nullptr;
+static uint32_t dma_size = 0;
+static uint32_t dma_capacity = 0;
+
+static status ready(handle instance, bool require_idle = true) noexcept
+{
+    if (peripherals::adc_handle(instance) == nullptr)
     {
-        return types::status::invalid_arg;
+        return status::not_configured;
     }
-    if (!detail::binding_for(channel_id, binding) || binding.adc == nullptr || binding.rank == 0U)
+    if (require_idle && active != operation::idle)
     {
-        return types::status::not_configured;
+        return status::busy;
     }
-    return types::status::ok;
+    return initialized ? status::ok : status::not_initialized;
 }
 
-std::size_t index_of(ADC_HandleTypeDef* handle) noexcept
+static void begin(ADC_HandleTypeDef* adc, operation mode) noexcept
 {
-    for (std::size_t index = 0U; index < channel_count; ++index)
-    {
-        detail::binding binding{};
-        if (detail::binding_for(static_cast<channel>(index), binding) && binding.adc == handle)
-        {
-            return index;
-        }
-    }
-    return channel_count;
+    const uint32_t management =
+        mode == operation::dma ? ADC_CONVERSIONDATA_DMA_ONESHOT : ADC_CONVERSIONDATA_DR;
+    adc->Init.ConversionDataManagement = management;
+    MODIFY_REG(adc->Instance->CFGR, ADC_CFGR_DMNGT_0 | ADC_CFGR_DMNGT_1, management);
+    current.complete = false;
+    current.dma = mode == operation::dma;
+    current.last_status = status::ok;
+    current.busy = true;
+    active = mode;
 }
 
-void set_data_management(ADC_HandleTypeDef* handle, uint32_t mode) noexcept
+static status finish(HAL_StatusTypeDef value) noexcept
 {
-    handle->Init.ConversionDataManagement = mode;
-    MODIFY_REG(handle->Instance->CFGR, ADC_CFGR_DMNGT_0 | ADC_CFGR_DMNGT_1, mode);
+    current.last_status = bsp::to_status(value);
+    current.busy = false;
+    current.dma = false;
+    active = operation::idle;
+    dma_data = nullptr;
+    dma_size = dma_capacity = 0;
+    return current.last_status;
 }
 
-bool prepare_dma_buffer(bsp::dma::buffer_view buffer) noexcept
+static status stop(handle instance, bool dma) noexcept
 {
-    if (!bsp::dma::valid(buffer))
+    if (const auto checked = ready(instance, false); checked != status::ok)
     {
-        return false;
+        return checked;
     }
-#if defined(__DCACHE_PRESENT) && (__DCACHE_PRESENT == 1U)
-    SCB_InvalidateDCache_by_Addr(reinterpret_cast<uint32_t*>(buffer.data()),
-                                 static_cast<int32_t>(buffer.capacity()));
-#endif
-    return true;
+    if (dma ? active != operation::dma : active == operation::dma)
+    {
+        return dma ? status::invalid_arg : status::busy;
+    }
+    auto* adc = peripherals::adc_handle(instance);
+    const auto stopped = dma ? HAL_ADC_Stop_DMA(adc) : HAL_ADC_Stop_IT(adc);
+    if (stopped != HAL_OK)
+    {
+        return current.last_status = bsp::to_status(stopped);
+    }
+    if (dma)
+    {
+        SCB_InvalidateDCache_by_Addr(reinterpret_cast<uint32_t*>(dma_data),
+                                     static_cast<int32_t>(dma_capacity));
+    }
+    return finish(stopped);
 }
 
-bool finish_dma_buffer(bsp::dma::buffer_view buffer) noexcept
+status init(const config& resource) noexcept
 {
-    return prepare_dma_buffer(buffer);
-}
-
-} // namespace
-
-types::status init(channel channel_id)
-{
-    detail::binding binding{};
-    const types::status status = get_binding(channel_id, binding);
-    if (status != types::status::ok)
+    auto* adc = peripherals::adc_handle(resource.instance);
+    if (adc == nullptr)
     {
-        return status;
+        return status::not_configured;
     }
-    if (binding.adc->Init.NbrOfConversion != 1U || binding.adc->Init.ScanConvMode != ADC_SCAN_DISABLE ||
-        binding.adc->Init.ExternalTrigConv != ADC_SOFTWARE_START)
+    if (active != operation::idle)
     {
-        return types::status::not_configured;
+        return status::busy;
     }
-    return types::status::ok;
-}
-
-types::status calibrate(channel channel_id)
-{
-    detail::binding binding{};
-    const types::status status = get_binding(channel_id, binding);
-    if (status != types::status::ok)
-    {
-        return status;
-    }
-    return HAL_ADCEx_Calibration_Start(binding.adc, ADC_CALIB_OFFSET, ADC_SINGLE_ENDED) == HAL_OK
-               ? types::status::ok
-               : types::status::error;
-}
-
-types::status read_raw(channel channel_id, std::uint32_t& raw_value, std::uint32_t timeout_ms)
-{
-    detail::binding binding{};
-    const types::status status = get_binding(channel_id, binding);
-    if (status != types::status::ok)
-    {
-        return status;
-    }
-    const std::size_t index = static_cast<std::size_t>(channel_id);
-    if (conversion_states[index].busy)
-    {
-        return types::status::busy;
-    }
-
-    set_data_management(binding.adc, ADC_CONVERSIONDATA_DR);
-
     ADC_ChannelConfTypeDef channel_config{};
-    channel_config.Channel = binding.hal_channel;
-    channel_config.Rank = binding.rank;
-    channel_config.SamplingTime = binding.sampling_time;
+    channel_config.Channel = peripherals::adc_channel(resource.channel);
+    channel_config.Rank = peripherals::adc_rank(resource.rank);
+    channel_config.SamplingTime = peripherals::adc_sampling_time(resource.sampling);
+    if (channel_config.Channel == UINT32_MAX || channel_config.Rank != ADC_REGULAR_RANK_1 ||
+        channel_config.SamplingTime == UINT32_MAX)
+    {
+        return status::invalid_arg;
+    }
+    initialized = false;
+    if (adc->Instance == nullptr || HAL_ADC_GetState(adc) == HAL_ADC_STATE_RESET)
+    {
+        return current.last_status = status::not_initialized;
+    }
+    if (adc->Init.NbrOfConversion != 1 || adc->Init.ScanConvMode != ADC_SCAN_DISABLE ||
+        adc->Init.ExternalTrigConv != ADC_SOFTWARE_START ||
+        adc->Init.ExternalTrigConvEdge != ADC_EXTERNALTRIGCONVEDGE_NONE)
+    {
+        return current.last_status = status::not_configured;
+    }
     channel_config.SingleDiff = ADC_SINGLE_ENDED;
     channel_config.OffsetNumber = ADC_OFFSET_NONE;
-    channel_config.Offset = 0;
-    channel_config.OffsetSignedSaturation = DISABLE;
-    if (HAL_ADC_ConfigChannel(binding.adc, &channel_config) != HAL_OK)
-    {
-        return types::status::error;
-    }
-    if (HAL_ADC_Start(binding.adc) != HAL_OK)
-    {
-        return types::status::error;
-    }
-    if (HAL_ADC_PollForConversion(binding.adc, timeout_ms) != HAL_OK)
-    {
-        static_cast<void>(HAL_ADC_Stop(binding.adc));
-        return types::status::error;
-    }
-
-    const std::uint32_t value = HAL_ADC_GetValue(binding.adc);
-    if (HAL_ADC_Stop(binding.adc) != HAL_OK)
-    {
-        return types::status::error;
-    }
-    raw_value = value;
-    return types::status::ok;
+    const auto value = HAL_ADC_ConfigChannel(adc, &channel_config);
+    initialized = value == HAL_OK;
+    current.complete = false;
+    return finish(value);
 }
 
-types::status start_it(channel channel_id)
+status calibrate(handle instance) noexcept
 {
-    detail::binding binding{};
-    const types::status status = get_binding(channel_id, binding);
-    if (status != types::status::ok)
+    if (const auto checked = ready(instance); checked != status::ok)
     {
-        return status;
+        return checked;
     }
-
-    const std::size_t index = static_cast<std::size_t>(channel_id);
-    conversion_state& state = conversion_states[index];
-    if (state.busy)
-    {
-        return types::status::busy;
-    }
-
-    set_data_management(binding.adc, ADC_CONVERSIONDATA_DR);
-    state.busy = true;
-    state.complete = false;
-    state.dma = false;
-    state.last_status = types::status::ok;
-    if (HAL_ADC_Start_IT(binding.adc) != HAL_OK)
-    {
-        state.busy = false;
-        state.complete = true;
-        state.last_status = types::status::error;
-        return types::status::error;
-    }
-    return types::status::ok;
+    return finish(HAL_ADCEx_Calibration_Start(peripherals::adc_handle(instance), ADC_CALIB_OFFSET,
+                                              ADC_SINGLE_ENDED));
 }
 
-types::status start_dma(channel channel_id, bsp::dma::buffer_view buffer)
+status read_raw(handle instance, uint32_t& value, uint32_t timeout_ms) noexcept
 {
-    if (!bsp::dma::valid(buffer) || (buffer.logical_size() % sizeof(uint32_t)) != 0U)
+    if (const auto checked = ready(instance); checked != status::ok)
     {
-        return types::status::invalid_arg;
+        return checked;
     }
-
-    detail::binding binding{};
-    const types::status status = get_binding(channel_id, binding);
-    if (status != types::status::ok)
+    auto* adc = peripherals::adc_handle(instance);
+    begin(adc, operation::polling);
+    auto converted = HAL_ADC_Start(adc);
+    if (converted != HAL_OK)
     {
-        return status;
+        return finish(converted);
     }
-    if (binding.adc->DMA_Handle == nullptr)
+    converted = HAL_ADC_PollForConversion(adc, timeout_ms);
+    const auto raw = converted == HAL_OK ? HAL_ADC_GetValue(adc) : 0U;
+    const auto stopped = HAL_ADC_Stop(adc);
+    if (stopped != HAL_OK)
     {
-        return types::status::not_configured;
+        // stop_it retries polling/interrupt cleanup without releasing ownership.
+        return current.last_status = bsp::to_status(stopped);
     }
-
-    const std::size_t index = static_cast<std::size_t>(channel_id);
-    conversion_state& state = conversion_states[index];
-    if (state.busy)
+    if (converted == HAL_OK)
     {
-        return types::status::busy;
+        value = raw;
+        current.last_value = raw;
+        current.complete = true;
     }
-    if (!prepare_dma_buffer(buffer))
-    {
-        return types::status::invalid_arg;
-    }
-
-    set_data_management(binding.adc, ADC_CONVERSIONDATA_DMA_ONESHOT);
-    dma_buffers[index] = buffer;
-    state.busy = true;
-    state.complete = false;
-    state.dma = true;
-    state.last_status = types::status::ok;
-    if (HAL_ADC_Start_DMA(binding.adc, reinterpret_cast<uint32_t*>(buffer.data()),
-                          static_cast<uint32_t>(buffer.logical_size() / sizeof(uint32_t))) != HAL_OK)
-    {
-        state.busy = false;
-        state.complete = true;
-        state.last_status = types::status::error;
-        dma_buffers[index] = {};
-        return types::status::error;
-    }
-    return types::status::ok;
+    return finish(converted);
 }
 
-types::status stop_dma(channel channel_id)
+status start_it(handle instance) noexcept
 {
-    detail::binding binding{};
-    const types::status status = get_binding(channel_id, binding);
-    if (status != types::status::ok)
+    if (const auto checked = ready(instance); checked != status::ok)
     {
-        return status;
+        return checked;
     }
-
-    const std::size_t index = static_cast<std::size_t>(channel_id);
-    conversion_state& state = conversion_states[index];
-    if (!state.dma)
+    if (NVIC_GetEnableIRQ(ADC_IRQn) == 0)
     {
-        return types::status::invalid_arg;
+        return status::not_configured;
     }
-    if (HAL_ADC_Stop_DMA(binding.adc) != HAL_OK)
-    {
-        state.last_status = types::status::error;
-        return types::status::error;
-    }
-    state.busy = false;
-    state.complete = true;
-    state.last_status = types::status::ok;
-    dma_buffers[index] = {};
-    return types::status::ok;
+    auto* adc = peripherals::adc_handle(instance);
+    begin(adc, operation::interrupt);
+    const auto started = HAL_ADC_Start_IT(adc);
+    return started == HAL_OK ? status::ok : finish(started);
 }
 
-const conversion_state& state(channel channel_id) noexcept
+status stop_it(handle instance) noexcept
 {
-    static const conversion_state unavailable{false, false, false, types::status::not_configured, 0U};
-    const std::size_t index = static_cast<std::size_t>(channel_id);
-    return index < channel_count ? conversion_states[index] : unavailable;
+    return stop(instance, false);
 }
 
-void handle_conversion_complete(ADC_HandleTypeDef* handle) noexcept
+status start_dma(handle instance, uint8_t* data, uint32_t size, uint32_t capacity) noexcept
 {
-    const std::size_t index = index_of(handle);
-    if (index >= channel_count || !conversion_states[index].busy)
+    if (const auto checked = ready(instance); checked != status::ok)
+    {
+        return checked;
+    }
+    const auto address = reinterpret_cast<uintptr_t>(data);
+    if (size == 0 || size % sizeof(uint32_t) != 0 || size / sizeof(uint32_t) > 0xFFFFU ||
+        capacity < size || capacity % memory::cache_line_size != 0 ||
+        address % memory::cache_line_size != 0 || address < 0x24000000U || address >= 0x24050000U ||
+        capacity > 0x24050000U - address)
+    {
+        return status::invalid_arg;
+    }
+    auto* adc = peripherals::adc_handle(instance);
+    auto* dma = adc->DMA_Handle;
+    if (dma == nullptr || dma->Instance == nullptr || dma->State != HAL_DMA_STATE_READY ||
+        dma->Init.Mode != DMA_NORMAL || dma->Init.Direction != DMA_PERIPH_TO_MEMORY ||
+        dma->Init.PeriphDataAlignment != DMA_PDATAALIGN_WORD ||
+        dma->Init.MemDataAlignment != DMA_MDATAALIGN_WORD || dma->Init.MemInc != DMA_MINC_ENABLE ||
+        (size > sizeof(uint32_t) && adc->Init.ContinuousConvMode != ENABLE))
+    {
+        return status::not_configured;
+    }
+    SCB_CleanInvalidateDCache_by_Addr(reinterpret_cast<uint32_t*>(data),
+                                      static_cast<int32_t>(capacity));
+    dma_data = data;
+    dma_size = size;
+    dma_capacity = capacity;
+    begin(adc, operation::dma);
+    const auto started =
+        HAL_ADC_Start_DMA(adc, reinterpret_cast<uint32_t*>(data), size / sizeof(uint32_t));
+    if (started == HAL_OK)
+    {
+        return status::ok;
+    }
+    current.last_status = bsp::to_status(started);
+    // HAL may have partially started DMA; retain ownership if cleanup fails.
+    const auto stopped = stop_dma(instance);
+    if (stopped != status::ok)
+    {
+        return stopped;
+    }
+    current.complete = false;
+    return current.last_status = bsp::to_status(started);
+}
+
+status stop_dma(handle instance) noexcept
+{
+    return stop(instance, true);
+}
+
+const conversion_state& state(handle instance) noexcept
+{
+    static const conversion_state unavailable{false, false, false, status::not_configured, 0};
+    return peripherals::adc_handle(instance) != nullptr ? current : unavailable;
+}
+
+void handle_conversion_complete(ADC_HandleTypeDef* adc) noexcept
+{
+    if (adc == nullptr || adc != peripherals::adc_handle(handle::adc1) ||
+        (active != operation::interrupt && active != operation::dma) ||
+        current.last_status != status::ok)
     {
         return;
     }
-
-    conversion_state& state = conversion_states[index];
-    bool success = true;
-    if (state.dma)
+    uint32_t value;
+    if (active == operation::dma)
     {
-        success = finish_dma_buffer(dma_buffers[index]);
+        SCB_InvalidateDCache_by_Addr(reinterpret_cast<uint32_t*>(dma_data),
+                                     static_cast<int32_t>(dma_capacity));
+        std::memcpy(&value, dma_data + dma_size - sizeof(value), sizeof(value));
     }
     else
     {
-        state.last_value = HAL_ADC_GetValue(handle);
+        value = HAL_ADC_GetValue(adc);
     }
-    state.busy = false;
-    state.complete = true;
-    state.last_status = success ? types::status::ok : types::status::error;
+    current.last_value = value;
+    current.busy = active == operation::interrupt && adc->Init.ContinuousConvMode == ENABLE;
+    // Retain ownership until stop_it/stop_dma, including after one-shot completion.
+    current.complete = true;
 }
 
-void handle_error(ADC_HandleTypeDef* handle) noexcept
+void handle_error(ADC_HandleTypeDef* adc) noexcept
 {
-    const std::size_t index = index_of(handle);
-    if (index >= channel_count)
+    if (adc == nullptr || adc != peripherals::adc_handle(handle::adc1) ||
+        (active != operation::interrupt && active != operation::dma))
     {
         return;
     }
-
-    conversion_state& state = conversion_states[index];
-    state.busy = false;
-    state.complete = true;
-    state.last_status = types::status::error;
+    current.last_status = status::error;
+    current.complete = true; // Stop explicitly before reusing ADC or DMA storage.
 }
-
 } // namespace bsp::adc
 
-extern "C" void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc)
+extern "C" void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* adc)
 {
-    bsp::adc::handle_conversion_complete(hadc);
+    bsp::adc::handle_conversion_complete(adc);
 }
 
-extern "C" void HAL_ADC_ErrorCallback(ADC_HandleTypeDef* hadc)
+extern "C" void HAL_ADC_ErrorCallback(ADC_HandleTypeDef* adc)
 {
-    bsp::adc::handle_error(hadc);
+    bsp::adc::handle_error(adc);
 }
+#endif

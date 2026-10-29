@@ -1,414 +1,392 @@
 #include "bsp_spi.hpp"
-
-#include <array>
-#include <limits>
+#include "bsp.hpp"
+#include "peripherals.hpp"
 
 namespace bsp::spi
 {
+using pnxtypes::status;
+static constexpr uint32_t count = sizeof(peripherals::spi_configs) / sizeof(config);
 
-namespace
-{
-
-struct transfer_context
+struct context
 {
     transfer_state state{};
-    bsp::dma::buffer_view dma_buffer{};
+    uint8_t* rx = nullptr;
+    uint32_t capacity = 0;
 };
 
-std::array<transfer_context, bus_count> transfers{};
+static context contexts[count]{};
 
-const bus_config* config_of(std::size_t index) noexcept
+static uint32_t index(handle instance) noexcept
 {
-    return index < bus_count ? &configs[index] : nullptr;
-}
-
-std::size_t index_of(SPI_HandleTypeDef* handle) noexcept
-{
-    for (std::size_t index = 0U; index < transfers.size(); ++index)
+    for (uint32_t i = 0; i < count; ++i)
     {
-        if (handle_of(static_cast<bus>(index)) == handle)
+        if (peripherals::spi_configs[i].instance == instance)
         {
-            return index;
+            return i;
         }
     }
-    return transfers.size();
+    return count;
 }
 
-bool supports_it(bus bus_id) noexcept
+static status ready(handle instance, uint32_t size, bool interrupt = false) noexcept
 {
-    detail::binding binding{};
-    return detail::binding_for(bus_id, binding) && binding.spi != nullptr && binding.has_irq;
+    const auto i = index(instance);
+    auto* native = peripherals::spi_handle(instance);
+    if (i == count || native == nullptr)
+    {
+        return status::not_configured;
+    }
+    if (native->Instance == nullptr || native->State == HAL_SPI_STATE_RESET)
+    {
+        return status::not_initialized;
+    }
+    if (contexts[i].state.busy || native->State != HAL_SPI_STATE_READY)
+    {
+        return status::busy;
+    }
+    if (size == 0 || size > UINT16_MAX)
+    {
+        return status::invalid_arg;
+    }
+    if (native->Init.DataSize != SPI_DATASIZE_8BIT ||
+        (interrupt && !peripherals::spi_configs[i].irq))
+    {
+        return status::not_configured;
+    }
+    return status::ok;
 }
 
-bool supports_dma(bus bus_id, bool receive) noexcept
+static void begin(context& item, bool receive, bool dma, uint8_t* rx = nullptr,
+                  uint32_t capacity = 0) noexcept
 {
-    detail::binding binding{};
-    if (!detail::binding_for(bus_id, binding) || binding.spi == nullptr)
-    {
-        return false;
-    }
-    return receive ? binding.has_rx_dma : binding.has_tx_dma;
+    item.rx = rx;
+    item.capacity = capacity;
+    item.state = {true, false, receive, dma, status::ok};
 }
 
-bool cache_range(bsp::dma::buffer_view buffer, std::uintptr_t& aligned_start,
-                 std::uintptr_t& aligned_end) noexcept
+static status finish(context& item, HAL_StatusTypeDef result) noexcept
 {
-    if (!bsp::dma::valid(buffer) || buffer.logical_size() > buffer.capacity())
+    if (item.rx != nullptr && item.state.dma)
     {
-        return false;
+        bsp::invalidate_cache(item.rx, item.capacity);
     }
-
-    const std::uintptr_t start = reinterpret_cast<std::uintptr_t>(buffer.data());
-    if (start > std::numeric_limits<std::uintptr_t>::max() - buffer.logical_size())
-    {
-        return false;
-    }
-    const std::uintptr_t end = start + buffer.logical_size();
-    if (end > std::numeric_limits<std::uintptr_t>::max() - (bsp::dma::cache_line_size - 1U))
-    {
-        return false;
-    }
-
-    aligned_start = start;
-    aligned_end = (end + bsp::dma::cache_line_size - 1U) & ~(bsp::dma::cache_line_size - 1U);
-    return aligned_end <= start + buffer.capacity();
+    item.rx = nullptr;
+    item.capacity = 0;
+    item.state.last_status = bsp::to_status(result);
+    item.state.complete = true;
+    item.state.busy = false;
+    return item.state.last_status;
 }
 
-bool clean_tx_buffer(bsp::dma::buffer_view buffer) noexcept
+static status started(handle instance, HAL_StatusTypeDef result) noexcept
 {
-#if defined(__DCACHE_PRESENT) && (__DCACHE_PRESENT == 1U)
-    std::uintptr_t aligned_start = 0U;
-    std::uintptr_t aligned_end = 0U;
-    if (!cache_range(buffer, aligned_start, aligned_end))
+    if (result == HAL_OK)
     {
-        return false;
+        return status::ok;
     }
-    SCB_CleanDCache_by_Addr(reinterpret_cast<uint32_t*>(aligned_start),
-                            static_cast<int32_t>(aligned_end - aligned_start));
-#else
-    (void)buffer;
+    auto& item = contexts[index(instance)];
+    item.state.last_status = bsp::to_status(result);
+    const auto stopped = HAL_SPI_Abort(peripherals::spi_handle(instance));
+    if (stopped != HAL_OK)
+    {
+        return item.state.last_status = bsp::to_status(stopped);
+    }
+    return finish(item, result);
+}
+
+static bool dma_ready(DMA_HandleTypeDef* dma, bool receive) noexcept
+{
+    return dma != nullptr && dma->Instance != nullptr && dma->Init.Mode == DMA_NORMAL &&
+           dma->Init.Direction == (receive ? DMA_PERIPH_TO_MEMORY : DMA_MEMORY_TO_PERIPH) &&
+           dma->Init.PeriphDataAlignment == DMA_PDATAALIGN_BYTE &&
+           dma->Init.MemDataAlignment == DMA_MDATAALIGN_BYTE && dma->Init.MemInc == DMA_MINC_ENABLE;
+}
+
+static status prepare_dma(handle instance, bool receive, const void* data, uint32_t size,
+                          uint32_t capacity) noexcept
+{
+    if (auto result = ready(instance, size); result != status::ok)
+    {
+        return result;
+    }
+    if (!memory::valid(data, size, capacity))
+    {
+        return status::invalid_arg;
+    }
+    auto* native = peripherals::spi_handle(instance);
+    const auto& resource = peripherals::spi_configs[index(instance)];
+    if (!(receive ? resource.dma.rx : resource.dma.tx) ||
+        !dma_ready(receive ? native->hdmarx : native->hdmatx, receive))
+    {
+        return status::not_configured;
+    }
+#if defined(STM32F407xx)
+    // F4 full-duplex master receive also needs TX DMA to generate the clocks.
+    if (receive && native->Init.Mode == SPI_MODE_MASTER &&
+        native->Init.Direction == SPI_DIRECTION_2LINES &&
+        (!resource.dma.tx || !dma_ready(native->hdmatx, false)))
+    {
+        return status::not_configured;
+    }
 #endif
-    return true;
+    return status::ok;
 }
 
-bool prepare_rx_buffer(bsp::dma::buffer_view buffer) noexcept
+status transmit(handle instance, const uint8_t* data, uint32_t size, uint32_t timeout) noexcept
 {
-#if defined(__DCACHE_PRESENT) && (__DCACHE_PRESENT == 1U)
-    if (!bsp::dma::valid(buffer))
+    if (data == nullptr)
     {
-        return false;
+        return status::invalid_arg;
     }
-    SCB_InvalidateDCache_by_Addr(reinterpret_cast<uint32_t*>(buffer.data()),
-                                 static_cast<int32_t>(buffer.capacity()));
-#else
-    (void)buffer;
+    if (auto result = ready(instance, size); result != status::ok)
+    {
+        return result;
+    }
+    auto& item = contexts[index(instance)];
+    begin(item, false, false);
+    return finish(item,
+                  HAL_SPI_Transmit(peripherals::spi_handle(instance), const_cast<uint8_t*>(data),
+                                   static_cast<uint16_t>(size), timeout));
+}
+
+status receive(handle instance, uint8_t* data, uint32_t size, uint32_t timeout) noexcept
+{
+    if (data == nullptr)
+    {
+        return status::invalid_arg;
+    }
+    if (auto result = ready(instance, size); result != status::ok)
+    {
+        return result;
+    }
+    auto& item = contexts[index(instance)];
+    begin(item, true, false);
+    return finish(item, HAL_SPI_Receive(peripherals::spi_handle(instance), data,
+                                        static_cast<uint16_t>(size), timeout));
+}
+
+status transmit_receive(handle instance, const uint8_t* tx, uint8_t* rx, uint32_t size,
+                        uint32_t timeout) noexcept
+{
+    if (tx == nullptr || rx == nullptr)
+    {
+        return status::invalid_arg;
+    }
+    if (auto result = ready(instance, size); result != status::ok)
+    {
+        return result;
+    }
+    auto& item = contexts[index(instance)];
+    begin(item, true, false);
+    return finish(item, HAL_SPI_TransmitReceive(peripherals::spi_handle(instance),
+                                                const_cast<uint8_t*>(tx), rx,
+                                                static_cast<uint16_t>(size), timeout));
+}
+
+status transmit_it(handle instance, const uint8_t* data, uint32_t size) noexcept
+{
+    if (data == nullptr)
+    {
+        return status::invalid_arg;
+    }
+    if (auto result = ready(instance, size, true); result != status::ok)
+    {
+        return result;
+    }
+    begin(contexts[index(instance)], false, false);
+    return started(instance,
+                   HAL_SPI_Transmit_IT(peripherals::spi_handle(instance),
+                                       const_cast<uint8_t*>(data), static_cast<uint16_t>(size)));
+}
+
+status receive_it(handle instance, uint8_t* data, uint32_t size) noexcept
+{
+    if (data == nullptr)
+    {
+        return status::invalid_arg;
+    }
+    if (auto result = ready(instance, size, true); result != status::ok)
+    {
+        return result;
+    }
+    begin(contexts[index(instance)], true, false);
+    return started(instance, HAL_SPI_Receive_IT(peripherals::spi_handle(instance), data,
+                                                static_cast<uint16_t>(size)));
+}
+
+status transmit_receive_it(handle instance, const uint8_t* tx, uint8_t* rx,
+    uint32_t size) noexcept
+{
+    if (tx == nullptr || rx == nullptr)
+    {
+        return status::invalid_arg;
+    }
+    if (auto result = ready(instance, size, true); result != status::ok)
+    {
+        return result;
+    }
+    auto* native = peripherals::spi_handle(instance);
+    if (native->Init.Direction != SPI_DIRECTION_2LINES)
+    {
+        return status::not_configured;
+    }
+    begin(contexts[index(instance)], true, false);
+    return started(instance, HAL_SPI_TransmitReceive_IT(native, const_cast<uint8_t*>(tx), rx,
+        static_cast<uint16_t>(size)));
+}
+
+status transmit_dma(handle instance, const uint8_t* data, uint32_t size, uint32_t capacity) noexcept
+{
+    if (auto result = prepare_dma(instance, false, data, size, capacity); result != status::ok)
+    {
+        return result;
+    }
+    bsp::clean_cache(data, capacity);
+    begin(contexts[index(instance)], false, true);
+    return started(instance,
+                   HAL_SPI_Transmit_DMA(peripherals::spi_handle(instance),
+                                        const_cast<uint8_t*>(data), static_cast<uint16_t>(size)));
+}
+
+status receive_dma(handle instance, uint8_t* data, uint32_t size, uint32_t capacity) noexcept
+{
+    if (auto result = prepare_dma(instance, true, data, size, capacity); result != status::ok)
+    {
+        return result;
+    }
+    bsp::prepare_rx_cache(data, capacity);
+    begin(contexts[index(instance)], true, true, data, capacity);
+    return started(instance, HAL_SPI_Receive_DMA(peripherals::spi_handle(instance), data,
+                                                 static_cast<uint16_t>(size)));
+}
+
+status transmit_receive_dma(handle instance, const uint8_t* tx, uint8_t* rx,
+    uint32_t size, uint32_t tx_capacity, uint32_t rx_capacity) noexcept
+{
+    if (auto result = prepare_dma(instance, false, tx, size, tx_capacity); result != status::ok)
+    {
+        return result;
+    }
+    if (auto result = prepare_dma(instance, true, rx, size, rx_capacity); result != status::ok)
+    {
+        return result;
+    }
+#if defined(STM32H723xx)
+    // H7 DMA completion enables EOT; F4 completes from the DMA callback alone.
+    if (!peripherals::spi_configs[index(instance)].irq)
+    {
+        return status::not_configured;
+    }
 #endif
-    return true;
+    auto* native = peripherals::spi_handle(instance);
+    if (native->Init.Direction != SPI_DIRECTION_2LINES)
+    {
+        return status::not_configured;
+    }
+    const auto tx_start = reinterpret_cast<uintptr_t>(tx);
+    const auto rx_start = reinterpret_cast<uintptr_t>(rx);
+    if (tx_start < rx_start + rx_capacity && rx_start < tx_start + tx_capacity)
+    {
+        return status::invalid_arg;
+    }
+    bsp::clean_cache(tx, tx_capacity);
+    bsp::prepare_rx_cache(rx, rx_capacity);
+    begin(contexts[index(instance)], true, true, rx, rx_capacity);
+    return started(instance, HAL_SPI_TransmitReceive_DMA(native, const_cast<uint8_t*>(tx), rx,
+        static_cast<uint16_t>(size)));
 }
 
-bool invalidate_rx_buffer(bsp::dma::buffer_view buffer) noexcept
+status abort(handle instance) noexcept
 {
-#if defined(__DCACHE_PRESENT) && (__DCACHE_PRESENT == 1U)
-    std::uintptr_t aligned_start = 0U;
-    std::uintptr_t aligned_end = 0U;
-    if (!cache_range(buffer, aligned_start, aligned_end))
+    const auto i = index(instance);
+    auto* native = peripherals::spi_handle(instance);
+    if (i == count || native == nullptr)
     {
-        return false;
+        return status::not_configured;
     }
-    SCB_InvalidateDCache_by_Addr(reinterpret_cast<uint32_t*>(aligned_start),
-                                 static_cast<int32_t>(aligned_end - aligned_start));
-#else
-    (void)buffer;
-#endif
-    return true;
+    if (native->Instance == nullptr || native->State == HAL_SPI_STATE_RESET)
+    {
+        return status::not_initialized;
+    }
+    const auto result = HAL_SPI_Abort(native);
+    if (result != HAL_OK)
+    {
+        return contexts[i].state.last_status = bsp::to_status(result);
+    }
+    return finish(contexts[i], result);
 }
 
-types::status begin_transfer(bus bus_id, bool receive, bool dma, SPI_HandleTypeDef*& handle,
-                             transfer_context*& context) noexcept
+status wait_ready(handle instance, uint32_t timeout) noexcept
 {
-    handle = handle_of(bus_id);
-    const std::size_t index = static_cast<std::size_t>(bus_id);
-    if (handle == nullptr || index >= transfers.size())
+    const auto i = index(instance);
+    auto* native = peripherals::spi_handle(instance);
+    if (i == count || native == nullptr)
     {
-        return types::status::not_configured;
+        return status::not_configured;
     }
-    context = &transfers[index];
-    if (context->state.busy)
+    if (native->Instance == nullptr || native->State == HAL_SPI_STATE_RESET)
     {
-        return types::status::busy;
+        return status::not_initialized;
     }
-    if ((dma && !supports_dma(bus_id, receive)) || (!dma && !supports_it(bus_id)))
+    const auto start = HAL_GetTick();
+    while (contexts[i].state.busy || native->State != HAL_SPI_STATE_READY)
     {
-        return types::status::not_configured;
+        if (timeout != HAL_MAX_DELAY && HAL_GetTick() - start >= timeout)
+        {
+            return status::timeout;
+        }
     }
-
-    context->state.busy = true;
-    context->state.complete = false;
-    context->state.receive = receive;
-    context->state.dma = dma;
-    context->state.last_status = types::status::ok;
-    context->dma_buffer = {};
-    return types::status::ok;
+    return status::ok;
 }
 
-void complete_transfer(SPI_HandleTypeDef* handle, bool success) noexcept
+const transfer_state& state(handle instance) noexcept
 {
-    const std::size_t index = index_of(handle);
-    if (index >= transfers.size())
+    static const transfer_state unavailable{false, false, false, false, status::not_configured};
+    const auto i = index(instance);
+    return i != count ? contexts[i].state : unavailable;
+}
+
+static void complete(SPI_HandleTypeDef* native, bool success) noexcept
+{
+    for (uint32_t i = 0; i < count; ++i)
     {
+        auto& item = contexts[i];
+        if (native == nullptr ||
+            peripherals::spi_handle(peripherals::spi_configs[i].instance) != native ||
+            !item.state.busy)
+        {
+            continue;
+        }
+        if (!success)
+        {
+            item.state.last_status = status::error;
+            item.state.complete = true;
+        }
+        else if (item.state.last_status == status::ok)
+        {
+            finish(item, HAL_OK);
+        }
         return;
     }
-
-    transfer_context& context = transfers[index];
-    if (success && context.state.dma && context.state.receive &&
-        !invalidate_rx_buffer(context.dma_buffer))
-    {
-        success = false;
-    }
-    context.state.busy = false;
-    context.state.complete = true;
-    context.state.last_status = success ? types::status::ok : types::status::error;
 }
-
-} // namespace
-
-bool bus_enabled(bus bus) noexcept
-{
-    const bus_config* cfg = config_of(static_cast<std::size_t>(bus));
-    return cfg != nullptr && cfg->enabled;
-}
-
-SPI_HandleTypeDef* handle_of(bus bus) noexcept
-{
-    if (!bus_enabled(bus))
-    {
-        return nullptr;
-    }
-    detail::binding binding{};
-    return detail::binding_for(bus, binding) ? binding.spi : nullptr;
-}
-
-types::status init(bus bus)
-{
-    return bus_enabled(bus) ? types::status::ok : types::status::not_configured;
-}
-
-types::status wait_ready(bus bus, uint32_t timeout_ms)
-{
-    if (!bus_enabled(bus))
-    {
-        return types::status::not_configured;
-    }
-
-    SPI_HandleTypeDef* handle = handle_of(bus);
-    if (handle == nullptr)
-    {
-        return types::status::invalid_arg;
-    }
-
-    const uint32_t start = HAL_GetTick();
-    while (handle->State != HAL_SPI_STATE_READY)
-    {
-        if ((HAL_GetTick() - start) > timeout_ms)
-        {
-            return types::status::error;
-        }
-    }
-
-    return types::status::ok;
-}
-
-types::status transmit(bus bus, const uint8_t* data, size_t len, uint32_t timeout_ms)
-{
-    if (!bus_enabled(bus))
-    {
-        return types::status::not_configured;
-    }
-
-    SPI_HandleTypeDef* handle = handle_of(bus);
-    if (handle == nullptr || data == nullptr || len == 0)
-    {
-        return types::status::invalid_arg;
-    }
-
-    if (HAL_SPI_Transmit(handle, const_cast<uint8_t*>(data), static_cast<uint16_t>(len),
-                         timeout_ms) != HAL_OK)
-    {
-        return types::status::error;
-    }
-
-    return types::status::ok;
-}
-
-types::status receive(bus bus, uint8_t* data, size_t len, uint32_t timeout_ms)
-{
-    if (!bus_enabled(bus))
-    {
-        return types::status::not_configured;
-    }
-
-    SPI_HandleTypeDef* handle = handle_of(bus);
-    if (handle == nullptr || data == nullptr || len == 0)
-    {
-        return types::status::invalid_arg;
-    }
-
-    if (HAL_SPI_Receive(handle, data, static_cast<uint16_t>(len), timeout_ms) != HAL_OK)
-    {
-        return types::status::error;
-    }
-
-    return types::status::ok;
-}
-
-types::status transmit_receive(bus bus, const uint8_t* tx, uint8_t* rx, size_t len,
-                               uint32_t timeout_ms)
-{
-    if (!bus_enabled(bus))
-    {
-        return types::status::not_configured;
-    }
-
-    SPI_HandleTypeDef* handle = handle_of(bus);
-    if (handle == nullptr || tx == nullptr || rx == nullptr || len == 0U ||
-        len > std::numeric_limits<uint16_t>::max())
-    {
-        return types::status::invalid_arg;
-    }
-
-    return HAL_SPI_TransmitReceive(handle, const_cast<uint8_t*>(tx), rx,
-                                   static_cast<uint16_t>(len), timeout_ms) == HAL_OK
-               ? types::status::ok
-               : types::status::error;
-}
-
-types::status transmit_it(bus bus_id, const uint8_t* data, size_t len)
-{
-    if (data == nullptr || len == 0U || len > std::numeric_limits<uint16_t>::max())
-    {
-        return types::status::invalid_arg;
-    }
-
-    SPI_HandleTypeDef* handle = nullptr;
-    transfer_context* context = nullptr;
-    const types::status status = begin_transfer(bus_id, false, false, handle, context);
-    if (status != types::status::ok)
-    {
-        return status;
-    }
-    if (HAL_SPI_Transmit_IT(handle, const_cast<uint8_t*>(data), static_cast<uint16_t>(len)) != HAL_OK)
-    {
-        complete_transfer(handle, false);
-        return types::status::error;
-    }
-    return types::status::ok;
-}
-
-types::status receive_it(bus bus_id, uint8_t* data, size_t len)
-{
-    if (data == nullptr || len == 0U || len > std::numeric_limits<uint16_t>::max())
-    {
-        return types::status::invalid_arg;
-    }
-
-    SPI_HandleTypeDef* handle = nullptr;
-    transfer_context* context = nullptr;
-    const types::status status = begin_transfer(bus_id, true, false, handle, context);
-    if (status != types::status::ok)
-    {
-        return status;
-    }
-    if (HAL_SPI_Receive_IT(handle, data, static_cast<uint16_t>(len)) != HAL_OK)
-    {
-        complete_transfer(handle, false);
-        return types::status::error;
-    }
-    return types::status::ok;
-}
-
-types::status transmit_dma(bus bus_id, bsp::dma::buffer_view buffer)
-{
-    if (!bsp::dma::valid(buffer) || buffer.logical_size() > std::numeric_limits<uint16_t>::max())
-    {
-        return types::status::invalid_arg;
-    }
-
-    SPI_HandleTypeDef* handle = nullptr;
-    transfer_context* context = nullptr;
-    const types::status status = begin_transfer(bus_id, false, true, handle, context);
-    if (status != types::status::ok)
-    {
-        return status;
-    }
-    context->dma_buffer = buffer;
-    if (!clean_tx_buffer(buffer) ||
-        HAL_SPI_Transmit_DMA(handle, buffer.data(), static_cast<uint16_t>(buffer.logical_size())) != HAL_OK)
-    {
-        complete_transfer(handle, false);
-        return types::status::error;
-    }
-    return types::status::ok;
-}
-
-types::status receive_dma(bus bus_id, bsp::dma::buffer_view buffer)
-{
-    if (!bsp::dma::valid(buffer) || buffer.logical_size() > std::numeric_limits<uint16_t>::max())
-    {
-        return types::status::invalid_arg;
-    }
-
-    SPI_HandleTypeDef* handle = nullptr;
-    transfer_context* context = nullptr;
-    const types::status status = begin_transfer(bus_id, true, true, handle, context);
-    if (status != types::status::ok)
-    {
-        return status;
-    }
-    context->dma_buffer = buffer;
-    if (!prepare_rx_buffer(buffer) ||
-        HAL_SPI_Receive_DMA(handle, buffer.data(), static_cast<uint16_t>(buffer.logical_size())) != HAL_OK)
-    {
-        complete_transfer(handle, false);
-        return types::status::error;
-    }
-    return types::status::ok;
-}
-
-const transfer_state& state(bus bus_id) noexcept
-{
-    static const transfer_state unavailable{false, false, false, false, types::status::not_configured};
-    const std::size_t index = static_cast<std::size_t>(bus_id);
-    return index < transfers.size() ? transfers[index].state : unavailable;
-}
-
-void handle_tx_complete(SPI_HandleTypeDef* handle) noexcept
-{
-    complete_transfer(handle, true);
-}
-
-void handle_rx_complete(SPI_HandleTypeDef* handle) noexcept
-{
-    complete_transfer(handle, true);
-}
-
-void handle_error(SPI_HandleTypeDef* handle) noexcept
-{
-    complete_transfer(handle, false);
-}
-
 } // namespace bsp::spi
 
-extern "C" void HAL_SPI_TxCpltCallback(SPI_HandleTypeDef* hspi)
+extern "C" void HAL_SPI_TxCpltCallback(SPI_HandleTypeDef* native)
 {
-    bsp::spi::handle_tx_complete(hspi);
+    bsp::spi::complete(native, true);
 }
 
-extern "C" void HAL_SPI_RxCpltCallback(SPI_HandleTypeDef* hspi)
+extern "C" void HAL_SPI_RxCpltCallback(SPI_HandleTypeDef* native)
 {
-    bsp::spi::handle_rx_complete(hspi);
+    bsp::spi::complete(native, true);
 }
 
-extern "C" void HAL_SPI_ErrorCallback(SPI_HandleTypeDef* hspi)
+extern "C" void HAL_SPI_TxRxCpltCallback(SPI_HandleTypeDef* native)
 {
-    bsp::spi::handle_error(hspi);
+    bsp::spi::complete(native, true);
+}
+
+extern "C" void HAL_SPI_ErrorCallback(SPI_HandleTypeDef* native)
+{
+    bsp::spi::complete(native, false);
 }

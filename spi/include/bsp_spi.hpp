@@ -1,59 +1,58 @@
 #pragma once
-
 #include "config.hpp"
-#include "bsp_dma.hpp"
-#include "spi.h"
-#include "usertypes.hpp"
-
-#include <cstddef>
-#include <cstdint>
+#include "memory.hpp"
+#include "status.hpp"
 
 namespace bsp::spi
 {
-
 struct transfer_state
 {
     volatile bool busy = false;
     volatile bool complete = false;
     volatile bool receive = false;
     volatile bool dma = false;
-    volatile types::status last_status = types::status::ok;
+    volatile pnxtypes::status last_status = pnxtypes::status::ok;
 };
 
-types::status wait_ready(bus bus, uint32_t timeout_ms = 1000);
-bool bus_enabled(bus bus) noexcept;
-SPI_HandleTypeDef* handle_of(bus bus) noexcept;
-types::status init(bus bus);
-types::status transmit(bus bus, const uint8_t* data, size_t len, uint32_t timeout_ms);
-types::status receive(bus bus, uint8_t* data, size_t len, uint32_t timeout_ms);
-// Blocking full-duplex exchange. Both buffers remain owned by the caller for
-// the duration of the call.
-types::status transmit_receive(bus bus, const uint8_t* tx, uint8_t* rx, size_t len,
-                               uint32_t timeout_ms);
-// IT buffers remain owned by the caller until the transfer state reports completion.
-types::status transmit_it(bus bus, const uint8_t* data, size_t len);
-types::status receive_it(bus bus, uint8_t* data, size_t len);
-// DMA buffers must be static bsp::dma::buffer<N> objects placed with BSP_DMA_BUFFER,
-// and remain owned by the caller until the transfer state reports completion.
-types::status transmit_dma(bus bus, bsp::dma::buffer_view buffer);
-types::status receive_dma(bus bus, bsp::dma::buffer_view buffer);
-const transfer_state& state(bus bus) noexcept;
-void handle_tx_complete(SPI_HandleTypeDef* handle) noexcept;
-void handle_rx_complete(SPI_HandleTypeDef* handle) noexcept;
-void handle_error(SPI_HandleTypeDef* handle) noexcept;
+// CubeMX initializes hardware first; serialize foreground calls per instance.
+pnxtypes::status wait_ready(handle instance, uint32_t timeout_ms = 1000) noexcept;
+pnxtypes::status transmit(handle instance, const uint8_t* data, uint32_t size,
+                          uint32_t timeout_ms) noexcept;
+pnxtypes::status receive(handle instance, uint8_t* data, uint32_t size,
+                         uint32_t timeout_ms) noexcept;
+pnxtypes::status transmit_receive(handle instance, const uint8_t* tx, uint8_t* rx, uint32_t size,
+                                  uint32_t timeout_ms) noexcept;
+pnxtypes::status transmit_it(handle instance, const uint8_t* data, uint32_t size) noexcept;
+pnxtypes::status receive_it(handle instance, uint8_t* data, uint32_t size) noexcept;
+pnxtypes::status transmit_receive_it(handle instance, const uint8_t* tx, uint8_t* rx,
+    uint32_t size) noexcept;
+pnxtypes::status transmit_dma(handle instance, const uint8_t* data, uint32_t size,
+                              uint32_t capacity) noexcept;
+pnxtypes::status receive_dma(handle instance, uint8_t* data, uint32_t size,
+                             uint32_t capacity) noexcept;
+// Full-duplex DMA requires separate, non-overlapping cache-line-isolated allocations.
+pnxtypes::status transmit_receive_dma(handle instance, const uint8_t* tx, uint8_t* rx,
+    uint32_t size, uint32_t tx_capacity, uint32_t rx_capacity) noexcept;
+// Borrow IT/DMA buffers until successful completion or abort. Error retains ownership.
+pnxtypes::status abort(handle instance) noexcept;
+const transfer_state& state(handle instance) noexcept;
+
+template <uint32_t N>
+pnxtypes::status transmit_dma(handle instance, const memory::buffer<N>& data) noexcept
+{
+    return transmit_dma(instance, data.data(), N, data.capacity());
+}
+
+template <uint32_t N>
+pnxtypes::status receive_dma(handle instance, memory::buffer<N>& data) noexcept
+{
+    return receive_dma(instance, data.data(), N, data.capacity());
+}
+
+template <uint32_t N>
+pnxtypes::status transmit_receive_dma(handle instance, const memory::buffer<N>& tx,
+    memory::buffer<N>& rx) noexcept
+{
+    return transmit_receive_dma(instance, tx.data(), rx.data(), N, tx.capacity(), rx.capacity());
+}
 } // namespace bsp::spi
-
-namespace bsp::spi::detail
-{
-
-struct binding
-{
-    SPI_HandleTypeDef* spi = nullptr;
-    bool has_irq = false;
-    bool has_rx_dma = false;
-    bool has_tx_dma = false;
-};
-
-bool binding_for(bus bus_id, binding& out) noexcept;
-
-} // namespace bsp::spi::detail

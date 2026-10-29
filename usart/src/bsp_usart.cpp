@@ -1,679 +1,464 @@
 #include "bsp_usart.hpp"
-
-#include "memory.h"
-
-#include <cstdint>
+#include "bsp.hpp"
+#include "peripherals.hpp"
 #include <cstring>
-#include <limits>
-
-extern "C" {
-extern DMA_HandleTypeDef hdma_uart5_rx;
-extern DMA_HandleTypeDef hdma_uart7_rx;
-extern DMA_HandleTypeDef hdma_uart7_tx;
-extern DMA_HandleTypeDef hdma_usart1_rx;
-extern DMA_HandleTypeDef hdma_usart1_tx;
-extern DMA_HandleTypeDef hdma_usart10_rx;
-}
-
-namespace
-{
-
-constexpr uint16_t dma_tx_stage_size = 256;
-constexpr std::uintptr_t dcache_line_size = 32U;
-
-struct port_state
-{
-    bool initialized = false;
-    bool tx_busy = false;
-    bsp::usart::mode port_mode = bsp::usart::mode::block;
-    bsp::usart::rx_callback callback{};
-    TX_SEMAPHORE* notify_sem = nullptr;
-    bsp::dma::buffer_view rx_buffer{};
-    size_t rx_position = 0;
-};
-
-port_state ports[bsp::usart::port_count]{};
-bsp::dma::buffer<dma_tx_stage_size> tx_dma_stage_buffers[bsp::usart::port_count] BSP_DMA_BUFFER{};
-
-port_state* state_of(bsp::usart::port port)
-{
-    if (static_cast<std::uint8_t>(port) >= bsp::usart::port_count)
-    {
-        return nullptr;
-    }
-
-    return &ports[port];
-}
-
-bsp::dma::buffer<dma_tx_stage_size>* tx_dma_stage_of(bsp::usart::port port)
-{
-    if (static_cast<std::uint8_t>(port) >= bsp::usart::port_count)
-    {
-        return nullptr;
-    }
-
-    return &tx_dma_stage_buffers[port];
-}
-
-std::uintptr_t align_down(std::uintptr_t value, std::uintptr_t alignment)
-{
-    return value & ~(alignment - 1U);
-}
-
-std::uintptr_t align_up(std::uintptr_t value, std::uintptr_t alignment)
-{
-    return (value + alignment - 1U) & ~(alignment - 1U);
-}
-
-bool cache_range_in_owner(bsp::dma::buffer_view buffer, size_t offset, size_t len,
-                          std::uintptr_t& aligned_start, std::uintptr_t& aligned_end)
-{
-    if (buffer.data() == nullptr || buffer.capacity() == 0U || offset > buffer.capacity() ||
-        len > buffer.capacity() - offset)
-    {
-        return false;
-    }
-
-    const std::uintptr_t owner_start = reinterpret_cast<std::uintptr_t>(buffer.data());
-    if (owner_start > std::numeric_limits<std::uintptr_t>::max() - buffer.capacity())
-    {
-        return false;
-    }
-    const std::uintptr_t owner_end = owner_start + buffer.capacity();
-    if (owner_start > std::numeric_limits<std::uintptr_t>::max() - offset)
-    {
-        return false;
-    }
-    const std::uintptr_t start = owner_start + offset;
-    if (start > std::numeric_limits<std::uintptr_t>::max() - len)
-    {
-        return false;
-    }
-    if (start + len > std::numeric_limits<std::uintptr_t>::max() - (dcache_line_size - 1U))
-    {
-        return false;
-    }
-
-    aligned_start = align_down(start, dcache_line_size);
-    aligned_end = align_up(start + len, dcache_line_size);
-    return aligned_start >= owner_start && aligned_end <= owner_end && aligned_end >= aligned_start;
-}
-
-bool invalidate_rx_region(bsp::dma::buffer_view buffer, size_t offset, size_t len)
-{
-#if defined(__DCACHE_PRESENT) && (__DCACHE_PRESENT == 1U)
-    if (offset > buffer.logical_size() || len > buffer.logical_size() - offset)
-    {
-        return false;
-    }
-    if (len == 0U)
-    {
-        return true;
-    }
-
-    std::uintptr_t aligned_start = 0U;
-    std::uintptr_t aligned_end = 0U;
-    if (!cache_range_in_owner(buffer, offset, len, aligned_start, aligned_end))
-    {
-        return false;
-    }
-    SCB_InvalidateDCache_by_Addr(reinterpret_cast<uint32_t*>(aligned_start),
-                                 static_cast<int32_t>(aligned_end - aligned_start));
-    return true;
-#else
-    (void)buffer;
-    (void)offset;
-    (void)len;
-    return true;
-#endif
-}
-
-bool prepare_rx_dma_buffer(bsp::dma::buffer_view buffer)
-{
-#if defined(__DCACHE_PRESENT) && (__DCACHE_PRESENT == 1U)
-    std::uintptr_t aligned_start = 0U;
-    std::uintptr_t aligned_end = 0U;
-    if (!cache_range_in_owner(buffer, 0U, buffer.capacity(), aligned_start, aligned_end))
-    {
-        return false;
-    }
-    SCB_InvalidateDCache_by_Addr(reinterpret_cast<uint32_t*>(aligned_start),
-                                 static_cast<int32_t>(aligned_end - aligned_start));
-#else
-    (void)buffer;
-#endif
-    return true;
-}
-
-bool clean_tx_dma_buffer(bsp::dma::buffer_view buffer, size_t len)
-{
-#if defined(__DCACHE_PRESENT) && (__DCACHE_PRESENT == 1U)
-    if (len == 0U)
-    {
-        return false;
-    }
-
-    std::uintptr_t aligned_start = 0U;
-    std::uintptr_t aligned_end = 0U;
-    if (!cache_range_in_owner(buffer, 0U, len, aligned_start, aligned_end))
-    {
-        return false;
-    }
-    SCB_CleanDCache_by_Addr(reinterpret_cast<uint32_t*>(aligned_start),
-                            static_cast<int32_t>(aligned_end - aligned_start));
-#else
-    (void)buffer;
-    (void)len;
-#endif
-    return true;
-}
-
-void notify_rx(bsp::usart::port port, uint8_t* data, size_t len)
-{
-    port_state* ctx = state_of(port);
-    if (ctx == nullptr || data == nullptr || len == 0)
-    {
-        return;
-    }
-
-    bsp::usart::rx_frame frame{data, len};
-    if (ctx->notify_sem != nullptr)
-    {
-        tx_semaphore_put(ctx->notify_sem);
-    }
-    if (ctx->callback)
-    {
-        ctx->callback(port, frame);
-    }
-}
-
-bool rx_dma_is_circular(UART_HandleTypeDef* handle)
-{
-    return handle != nullptr && handle->hdmarx != nullptr &&
-           handle->hdmarx->Init.Mode == DMA_CIRCULAR;
-}
-
-void disable_rx_half_transfer_irq(UART_HandleTypeDef* handle)
-{
-    if (handle != nullptr && handle->hdmarx != nullptr)
-    {
-        __HAL_DMA_DISABLE_IT(handle->hdmarx, DMA_IT_HT);
-    }
-}
-
-bool same_rx_owner(const port_state& ctx, bsp::dma::buffer_view buffer, bsp::usart::rx_callback callback,
-                   TX_SEMAPHORE* notify_sem)
-{
-    return ctx.rx_buffer.data() == buffer.data() && ctx.rx_buffer.logical_size() == buffer.logical_size() &&
-           ctx.rx_buffer.capacity() == buffer.capacity() && ctx.callback == callback &&
-           ctx.notify_sem == notify_sem;
-}
-
-} // namespace
 
 namespace bsp::usart
 {
+using pnxtypes::status;
+static constexpr uint32_t count = sizeof(peripherals::usart_configs) / sizeof(config);
 
-namespace
+struct context
 {
+    bool initialized = false;
+    volatile bool tx_busy = false;
+    mode method = mode::block;
+    uint8_t* rx = nullptr;
+    uint32_t size = 0, capacity = 0, position = 0;
+    rx_callback callback{};
+    TX_SEMAPHORE* notify = nullptr;
+    volatile status received = status::not_initialized;
+};
 
-const port_config* config_of(std::size_t index) noexcept
-{
-    return index < port_count ? &configs[index] : nullptr;
-}
+static context contexts[count]{};
+alignas(memory::cache_line_size < 2
+            ? 2
+            : memory::cache_line_size) static memory::buffer<256> tx_slots[count] RAM_D1_BSS;
 
-UART_HandleTypeDef* handle_from_id(handle_id id) noexcept
+static uint32_t index(handle instance) noexcept
 {
-    switch (id)
+    for (uint32_t i = 0; i < count; ++i)
     {
-    case handle_id::uart5:
-        return &huart5;
-    case handle_id::uart7:
-        return &huart7;
-    case handle_id::usart1:
-        return &huart1;
-    case handle_id::usart10:
-        return &huart10;
-    default:
-        return nullptr;
-    }
-}
-
-DMA_HandleTypeDef* rx_dma_from_id(handle_id id) noexcept
-{
-    switch (id)
-    {
-    case handle_id::uart5:
-        return &hdma_uart5_rx;
-    case handle_id::uart7:
-        return &hdma_uart7_rx;
-    case handle_id::usart1:
-        return &hdma_usart1_rx;
-    case handle_id::usart10:
-        return &hdma_usart10_rx;
-    default:
-        return nullptr;
-    }
-}
-
-DMA_HandleTypeDef* tx_dma_from_id(handle_id id) noexcept
-{
-    switch (id)
-    {
-    case handle_id::uart7:
-        return &hdma_uart7_tx;
-    case handle_id::usart1:
-        return &hdma_usart1_tx;
-    default:
-        return nullptr;
-    }
-}
-
-void enable_dma_irq(DMA_HandleTypeDef* dma) noexcept
-{
-    if (dma == nullptr)
-    {
-        return;
-    }
-
-    __HAL_DMA_DISABLE_IT(dma, DMA_IT_HT);
-    __HAL_DMA_ENABLE_IT(dma, DMA_IT_TC);
-}
-
-} // namespace
-
-UART_HandleTypeDef* handle_of(std::size_t index) noexcept
-{
-    const port_config* cfg = config_of(index);
-    return cfg != nullptr && cfg->enabled ? handle_from_id(cfg->handle) : nullptr;
-}
-
-std::size_t index_of(UART_HandleTypeDef* handle) noexcept
-{
-    for (std::size_t i = 0; i < port_count; ++i)
-    {
-        if (handle_of(i) == handle)
+        if (peripherals::usart_configs[i].instance == instance)
         {
             return i;
         }
     }
-    return port_count;
+    return count;
 }
 
-bool port_enabled(port port) noexcept
+static uint32_t index(UART_HandleTypeDef* native) noexcept
 {
-    const port_config* cfg = config_of(port);
-    return cfg != nullptr && cfg->enabled;
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        if (native != nullptr &&
+            peripherals::usart_handle(peripherals::usart_configs[i].instance) == native)
+        {
+            return i;
+        }
+    }
+    return count;
 }
 
-void setup_dma(UART_HandleTypeDef* handle) noexcept
+static uint32_t word_bytes(UART_HandleTypeDef* native) noexcept
 {
-    const std::size_t index = index_of(handle);
-    const port_config* cfg = config_of(index);
-    if (cfg == nullptr || !cfg->enabled)
+    return native->Init.WordLength == UART_WORDLENGTH_9B && native->Init.Parity == UART_PARITY_NONE
+               ? 2U
+               : 1U;
+}
+
+status init(const config& resource, mode method) noexcept
+{
+    const auto i = index(resource.instance);
+    auto* native = peripherals::usart_handle(resource.instance);
+    if (i == count || native == nullptr)
+    {
+        return status::not_configured;
+    }
+    auto& item = contexts[i];
+    if (item.tx_busy || item.rx != nullptr)
+    {
+        return status::busy;
+    }
+    if (static_cast<uint8_t>(method) > static_cast<uint8_t>(mode::dma))
+    {
+        return status::invalid_arg;
+    }
+    if (native->Instance == nullptr || native->gState == HAL_UART_STATE_RESET)
+    {
+        return status::not_initialized;
+    }
+    const auto& board = peripherals::usart_configs[i];
+    if ((resource.dma.rx && !board.dma.rx) || (resource.dma.tx && !board.dma.tx) ||
+        (method == mode::dma && (!board.dma.tx || native->hdmatx == nullptr)))
+    {
+        return status::not_configured;
+    }
+    __HAL_UART_FLUSH_DRREGISTER(native);
+    item.method = method;
+    item.initialized = true;
+    return status::ok;
+}
+
+status configure(handle instance, const line_config& settings) noexcept
+{
+    const auto i = index(instance);
+    auto* native = peripherals::usart_handle(instance);
+    if (i == count || native == nullptr)
+    {
+        return status::not_configured;
+    }
+    auto& item = contexts[i];
+    if (native->Instance == nullptr || native->gState == HAL_UART_STATE_RESET)
+    {
+        return status::not_initialized;
+    }
+    if (item.tx_busy || item.rx != nullptr || native->gState != HAL_UART_STATE_READY ||
+        native->RxState != HAL_UART_STATE_READY)
+    {
+        return status::busy;
+    }
+    const auto bits = static_cast<uint8_t>(settings.data_bits);
+    const auto stop = static_cast<uint8_t>(settings.stop);
+    const auto parity = static_cast<uint8_t>(settings.parity_mode);
+    if (settings.baud_rate == 0 || (!settings.enable_tx && !settings.enable_rx) || bits > 1 ||
+        stop > 1 || parity > 2)
+    {
+        return status::invalid_arg;
+    }
+    constexpr uint32_t words[]{UART_WORDLENGTH_8B, UART_WORDLENGTH_9B};
+    constexpr uint32_t stops[]{UART_STOPBITS_1, UART_STOPBITS_2};
+    constexpr uint32_t parities[]{UART_PARITY_NONE, UART_PARITY_EVEN, UART_PARITY_ODD};
+    const auto previous = native->Init;
+    native->Init.BaudRate = settings.baud_rate;
+    native->Init.WordLength = words[bits];
+    native->Init.StopBits = stops[stop];
+    native->Init.Parity = parities[parity];
+    native->Init.Mode =
+        (settings.enable_tx ? UART_MODE_TX : 0U) | (settings.enable_rx ? UART_MODE_RX : 0U);
+    native->Init.HwFlowCtl = UART_HWCONTROL_NONE;
+    const auto result = HAL_UART_Init(native);
+    item.initialized = false; // Reinitialize the BSP mode after line configuration.
+    if (result != HAL_OK)
+    {
+        native->Init = previous;
+    }
+    return bsp::to_status(result);
+}
+
+status transmit(handle instance, const uint8_t* data, uint32_t size, uint32_t timeout) noexcept
+{
+    const auto i = index(instance);
+    auto* native = peripherals::usart_handle(instance);
+    if (i == count || native == nullptr)
+    {
+        return status::not_configured;
+    }
+    auto& item = contexts[i];
+    if (!item.initialized)
+    {
+        return status::not_initialized;
+    }
+    const auto width = word_bytes(native);
+    if (data == nullptr || size == 0 || size % width != 0 || size / width > UINT16_MAX ||
+        reinterpret_cast<uintptr_t>(data) % width != 0)
+    {
+        return status::invalid_arg;
+    }
+    if ((native->Init.Mode & UART_MODE_TX) == 0)
+    {
+        return status::not_configured;
+    }
+    if (item.method != mode::dma)
+    {
+        return bsp::to_status(HAL_UART_Transmit(native, const_cast<uint8_t*>(data),
+                                                static_cast<uint16_t>(size / width), timeout));
+    }
+    auto* dma = native->hdmatx;
+    if (dma == nullptr || dma->Instance == nullptr || dma->Init.Mode != DMA_NORMAL ||
+        dma->Init.Direction != DMA_MEMORY_TO_PERIPH ||
+        dma->Init.PeriphDataAlignment !=
+            (width == 1 ? DMA_PDATAALIGN_BYTE : DMA_PDATAALIGN_HALFWORD) ||
+        dma->Init.MemDataAlignment !=
+            (width == 1 ? DMA_MDATAALIGN_BYTE : DMA_MDATAALIGN_HALFWORD) ||
+        dma->Init.MemInc != DMA_MINC_ENABLE)
+    {
+        return status::not_configured;
+    }
+    if (size > tx_slots[i].logical_size() || !memory::valid(tx_slots[i]))
+    {
+        return status::invalid_arg;
+    }
+    const auto mask = __get_PRIMASK();
+    __disable_irq();
+    if (item.tx_busy)
+    {
+        __set_PRIMASK(mask);
+        return status::busy;
+    }
+    item.tx_busy = true;
+    __set_PRIMASK(mask);
+    std::memcpy(tx_slots[i].data(), data, size);
+    bsp::clean_cache(tx_slots[i].data(), tx_slots[i].capacity());
+    const auto result =
+        HAL_UART_Transmit_DMA(native, tx_slots[i].data(), static_cast<uint16_t>(size / width));
+    if (result != HAL_OK)
+    {
+        // Abort a partial HAL start before allowing the staging slot to be overwritten.
+        if (HAL_UART_AbortTransmit(native) == HAL_OK)
+        {
+            item.tx_busy = false;
+        }
+    }
+    return bsp::to_status(result);
+}
+
+status abort_tx(handle instance) noexcept
+{
+    const auto i = index(instance);
+    auto* native = peripherals::usart_handle(instance);
+    if (i == count || native == nullptr)
+    {
+        return status::not_configured;
+    }
+    if (!contexts[i].initialized)
+    {
+        return status::not_initialized;
+    }
+    const auto result = HAL_UART_AbortTransmit(native);
+    if (result == HAL_OK)
+    {
+        contexts[i].tx_busy = false;
+    }
+    return bsp::to_status(result);
+}
+
+status restart_rx(handle instance) noexcept
+{
+    const auto i = index(instance);
+    auto* native = peripherals::usart_handle(instance);
+    if (i == count || native == nullptr)
+    {
+        return status::not_configured;
+    }
+    auto& item = contexts[i];
+    if (!item.initialized)
+    {
+        return status::not_initialized;
+    }
+    if (!memory::valid(item.rx, item.size, item.capacity))
+    {
+        return item.received = status::invalid_arg;
+    }
+    if (native->RxState != HAL_UART_STATE_READY)
+    {
+        return item.received = status::busy;
+    }
+    bsp::prepare_rx_cache(item.rx, item.capacity);
+    item.position = 0;
+    const auto result = HAL_UARTEx_ReceiveToIdle_DMA(
+        native, item.rx, static_cast<uint16_t>(item.size / word_bytes(native)));
+    if (result == HAL_OK)
+    {
+        __HAL_DMA_DISABLE_IT(native->hdmarx, DMA_IT_HT);
+    }
+    return item.received = bsp::to_status(result);
+}
+
+status start_rx_to_idle(handle instance, uint8_t* data, uint32_t size, uint32_t capacity,
+                        rx_callback callback, TX_SEMAPHORE* notify) noexcept
+{
+    const auto i = index(instance);
+    auto* native = peripherals::usart_handle(instance);
+    if (i == count || native == nullptr)
+    {
+        return status::not_configured;
+    }
+    auto& item = contexts[i];
+    if (!item.initialized)
+    {
+        return status::not_initialized;
+    }
+    const auto width = word_bytes(native);
+    if (size % width != 0 || size / width > UINT16_MAX ||
+        reinterpret_cast<uintptr_t>(data) % width != 0 || !memory::valid(data, size, capacity))
+    {
+        return status::invalid_arg;
+    }
+    auto* dma = native->hdmarx;
+    if (!peripherals::usart_configs[i].dma.rx || dma == nullptr || dma->Instance == nullptr ||
+        (native->Init.Mode & UART_MODE_RX) == 0 || dma->Init.Direction != DMA_PERIPH_TO_MEMORY ||
+        dma->Init.PeriphDataAlignment !=
+            (width == 1 ? DMA_PDATAALIGN_BYTE : DMA_PDATAALIGN_HALFWORD) ||
+        dma->Init.MemDataAlignment !=
+            (width == 1 ? DMA_MDATAALIGN_BYTE : DMA_MDATAALIGN_HALFWORD) ||
+        dma->Init.MemInc != DMA_MINC_ENABLE)
+    {
+        return status::not_configured;
+    }
+    if (item.rx != nullptr)
+    {
+        if (item.rx != data || item.size != size || item.capacity != capacity ||
+            item.callback != callback || item.notify != notify)
+        {
+            return status::busy;
+        }
+        return restart_rx(instance);
+    }
+    if (native->RxState != HAL_UART_STATE_READY)
+    {
+        return status::busy;
+    }
+    // Publish ownership before starting HAL, which can immediately invoke a callback.
+    item.rx = data;
+    item.size = size;
+    item.capacity = capacity;
+    item.callback = callback;
+    item.notify = notify;
+    const auto result = restart_rx(instance);
+    if (result != status::ok && HAL_UART_AbortReceive(native) == HAL_OK)
+    {
+        const auto mask = __get_PRIMASK();
+        __disable_irq();
+        item.rx = nullptr;
+        item.callback = {};
+        item.notify = nullptr;
+        __set_PRIMASK(mask);
+    }
+    return result;
+}
+
+status stop_rx(handle instance) noexcept
+{
+    const auto i = index(instance);
+    auto* native = peripherals::usart_handle(instance);
+    if (i == count || native == nullptr)
+    {
+        return status::not_configured;
+    }
+    auto& item = contexts[i];
+    if (item.rx == nullptr)
+    {
+        return item.received = status::ok;
+    }
+    const auto result = HAL_UART_AbortReceive(native);
+    if (result != HAL_OK)
+    {
+        return item.received = bsp::to_status(result);
+    }
+    bsp::invalidate_cache(item.rx, item.capacity);
+    const auto mask = __get_PRIMASK();
+    __disable_irq();
+    item.rx = nullptr;
+    item.size = item.capacity = item.position = 0;
+    item.callback = {};
+    item.notify = nullptr;
+    item.received = status::ok;
+    __set_PRIMASK(mask);
+    return status::ok;
+}
+
+status rx_status(handle instance) noexcept
+{
+    const auto i = index(instance);
+    return i != count ? contexts[i].received : status::not_configured;
+}
+
+static void notify(uint32_t i, uint32_t offset, uint32_t size) noexcept
+{
+    if (size == 0)
     {
         return;
     }
-
-    if (cfg->has_rx_dma)
+    auto& item = contexts[i];
+    const auto start = reinterpret_cast<uintptr_t>(item.rx + offset);
+    const auto aligned = start & ~(static_cast<uintptr_t>(memory::cache_line_size) - 1U);
+    const auto end = (start + size + memory::cache_line_size - 1U) &
+                     ~(static_cast<uintptr_t>(memory::cache_line_size) - 1U);
+    bsp::invalidate_cache(reinterpret_cast<void*>(aligned), static_cast<uint32_t>(end - aligned));
+    if (item.callback)
     {
-        enable_dma_irq(rx_dma_from_id(cfg->handle));
+        item.callback(peripherals::usart_configs[i].instance, item.rx + offset, size);
     }
-    if (cfg->has_tx_dma)
+    if (item.notify != nullptr)
     {
-        enable_dma_irq(tx_dma_from_id(cfg->handle));
+        (void)tx_semaphore_put(item.notify);
     }
 }
 
-types::status restart_rx(port port)
+static void receive(UART_HandleTypeDef* native, uint16_t words) noexcept
 {
-    port_state* ctx = state_of(port);
-    UART_HandleTypeDef* handle = handle_of(port);
-    if (ctx == nullptr || handle == nullptr || !bsp::dma::valid(ctx->rx_buffer))
+    const auto i = index(native);
+    if (i == count)
     {
-        return types::status::invalid_arg;
+        return;
     }
-
-    if (!prepare_rx_dma_buffer(ctx->rx_buffer))
+    auto& item = contexts[i];
+    const auto size = static_cast<uint32_t>(words) * word_bytes(native);
+    if (item.rx == nullptr || size > item.size)
     {
-        return types::status::invalid_arg;
+        return;
     }
-
-    if (HAL_UARTEx_ReceiveToIdle_DMA(handle, ctx->rx_buffer.data(),
-                                     static_cast<uint16_t>(ctx->rx_buffer.logical_size())) != HAL_OK)
-    {
-        return types::status::error;
-    }
-
-    disable_rx_half_transfer_irq(handle);
-    ctx->rx_position = 0;
-
-    return types::status::ok;
-}
-
-void receive(UART_HandleTypeDef* handle, uint16_t size)
-{
-    const HAL_UART_RxEventTypeTypeDef event = HAL_UARTEx_GetRxEventType(handle);
+    const auto event = HAL_UARTEx_GetRxEventType(native);
     if (event == HAL_UART_RXEVENT_HT)
     {
         return;
     }
+    if (native->hdmarx->Init.Mode != DMA_CIRCULAR)
+    {
+        notify(i, 0, size);
+        (void)restart_rx(peripherals::usart_configs[i].instance);
+        return;
+    }
+    const uint32_t position = size < item.size ? size : 0;
+    if (event == HAL_UART_RXEVENT_TC)
+    {
+        notify(i, item.position, item.size - item.position);
+        item.position = 0;
+    }
+    else
+    {
+        if (position < item.position)
+        {
+            notify(i, item.position, item.size - item.position);
+            item.position = 0;
+        }
+        if (position > item.position)
+        {
+            notify(i, item.position, position - item.position);
+        }
+        item.position = position;
+    }
+}
 
-    const port port = index_of(handle);
-    port_state* ctx = state_of(port);
-    if (ctx == nullptr || !bsp::dma::valid(ctx->rx_buffer))
+static void error(UART_HandleTypeDef* native) noexcept
+{
+    const auto i = index(native);
+    if (i == count || contexts[i].rx == nullptr)
     {
         return;
     }
-
-    if (rx_dma_is_circular(handle))
+    __HAL_UART_CLEAR_OREFLAG(native);
+    const auto aborted = HAL_UART_AbortReceive(native);
+    if (aborted != HAL_OK)
     {
-        const size_t buffer_len = ctx->rx_buffer.logical_size();
-        if (size > buffer_len)
-        {
-            return;
-        }
-        const size_t position = size < buffer_len ? size : 0U;
-
-        if (event == HAL_UART_RXEVENT_TC)
-        {
-            if (ctx->rx_position < buffer_len)
-            {
-                const size_t len = buffer_len - ctx->rx_position;
-                if (invalidate_rx_region(ctx->rx_buffer, ctx->rx_position, len))
-                {
-                    notify_rx(port, ctx->rx_buffer.data() + ctx->rx_position, len);
-                }
-            }
-            ctx->rx_position = 0;
-            return;
-        }
-
-        if (position > ctx->rx_position)
-        {
-            const size_t len = position - ctx->rx_position;
-            if (invalidate_rx_region(ctx->rx_buffer, ctx->rx_position, len))
-            {
-                notify_rx(port, ctx->rx_buffer.data() + ctx->rx_position, len);
-            }
-        }
-        else if (position < ctx->rx_position)
-        {
-            const size_t tail_len = buffer_len - ctx->rx_position;
-            if (invalidate_rx_region(ctx->rx_buffer, ctx->rx_position, tail_len))
-            {
-                notify_rx(port, ctx->rx_buffer.data() + ctx->rx_position, tail_len);
-            }
-            if (position > 0U)
-            {
-                if (invalidate_rx_region(ctx->rx_buffer, 0U, position))
-                {
-                    notify_rx(port, ctx->rx_buffer.data(), position);
-                }
-            }
-        }
-        ctx->rx_position = position;
+        contexts[i].received = bsp::to_status(aborted);
         return;
     }
-
-    if (size > ctx->rx_buffer.logical_size() || !invalidate_rx_region(ctx->rx_buffer, 0U, size))
-    {
-        return;
-    }
-    notify_rx(port, ctx->rx_buffer.data(), size);
-    restart_rx(port);
+    (void)restart_rx(peripherals::usart_configs[i].instance);
 }
 
-void handle_error(UART_HandleTypeDef* handle)
+static void transmitted(UART_HandleTypeDef* native) noexcept
 {
-    __HAL_UART_CLEAR_OREFLAG(handle);
-    restart_rx(index_of(handle));
+    const auto i = index(native);
+    if (i != count)
+    {
+        contexts[i].tx_busy = false;
+    }
 }
-
-void handle_tx_complete(UART_HandleTypeDef* handle)
-{
-    const port current_port = index_of(handle);
-    port_state* ctx = state_of(current_port);
-    if (ctx == nullptr)
-    {
-        return;
-    }
-
-    ctx->tx_busy = false;
-}
-
-types::status init(port port, mode mode)
-{
-    if (port >= port_count)
-    {
-        return types::status::invalid_arg;
-    }
-
-    if (!port_enabled(port))
-    {
-        return types::status::not_configured;
-    }
-
-    UART_HandleTypeDef* handle = handle_of(port);
-    port_state* ctx = state_of(port);
-    if (handle == nullptr || ctx == nullptr)
-    {
-        return types::status::invalid_arg;
-    }
-
-    if (ctx->initialized)
-    {
-        return types::status::ok;
-    }
-
-    if (mode == mode::dma)
-    {
-        setup_dma(handle);
-    }
-
-    __HAL_UART_SEND_REQ(handle, UART_RXDATA_FLUSH_REQUEST);
-    ctx->port_mode = mode;
-    ctx->initialized = true;
-    return types::status::ok;
-}
-
-types::status configure(port port, const line_config& config)
-{
-    if (port >= port_count || config.baud_rate == 0U ||
-        (!config.enable_tx && !config.enable_rx))
-    {
-        return types::status::invalid_arg;
-    }
-
-    UART_HandleTypeDef* handle = handle_of(port);
-    port_state* ctx = state_of(port);
-    if (handle == nullptr || ctx == nullptr || ctx->rx_buffer.data() != nullptr)
-    {
-        return types::status::invalid_arg;
-    }
-
-    switch (config.data_bits)
-    {
-    case word_length::bits_8:
-        handle->Init.WordLength = UART_WORDLENGTH_8B;
-        break;
-    case word_length::bits_9:
-        handle->Init.WordLength = UART_WORDLENGTH_9B;
-        break;
-    default:
-        return types::status::invalid_arg;
-    }
-
-    switch (config.stop)
-    {
-    case stop_bits::one:
-        handle->Init.StopBits = UART_STOPBITS_1;
-        break;
-    case stop_bits::two:
-        handle->Init.StopBits = UART_STOPBITS_2;
-        break;
-    default:
-        return types::status::invalid_arg;
-    }
-
-    switch (config.parity_mode)
-    {
-    case parity::none:
-        handle->Init.Parity = UART_PARITY_NONE;
-        break;
-    case parity::even:
-        handle->Init.Parity = UART_PARITY_EVEN;
-        break;
-    case parity::odd:
-        handle->Init.Parity = UART_PARITY_ODD;
-        break;
-    default:
-        return types::status::invalid_arg;
-    }
-
-    handle->Init.BaudRate = config.baud_rate;
-    handle->Init.Mode =
-        (config.enable_tx ? UART_MODE_TX : 0U) | (config.enable_rx ? UART_MODE_RX : 0U);
-    handle->Init.HwFlowCtl = UART_HWCONTROL_NONE;
-
-    if (HAL_UART_Init(handle) != HAL_OK)
-    {
-        return types::status::error;
-    }
-
-    ctx->initialized = false;
-    return types::status::ok;
-}
-
-types::status transmit(port port, const uint8_t* data, size_t len, uint32_t timeout_ms)
-{
-    if (data == nullptr || len == 0)
-    {
-        return types::status::invalid_arg;
-    }
-
-    if (port >= port_count)
-    {
-        return types::status::invalid_arg;
-    }
-
-    if (!port_enabled(port))
-    {
-        return types::status::not_configured;
-    }
-
-    UART_HandleTypeDef* handle = handle_of(port);
-    port_state* ctx = state_of(port);
-    if (handle == nullptr || ctx == nullptr || !ctx->initialized)
-    {
-        return types::status::error;
-    }
-
-    if (ctx->port_mode == mode::dma)
-    {
-        if (ctx->tx_busy)
-        {
-            return types::status::busy;
-        }
-
-        bsp::dma::buffer<dma_tx_stage_size>* tx_dma_stage = tx_dma_stage_of(port);
-        if (tx_dma_stage == nullptr || len > tx_dma_stage->logical_size())
-        {
-            return types::status::invalid_arg;
-        }
-
-        std::memcpy(tx_dma_stage->data(), data, len);
-        if (!clean_tx_dma_buffer(tx_dma_stage->view(), len))
-        {
-            return types::status::invalid_arg;
-        }
-        ctx->tx_busy = true;
-        if (HAL_UART_Transmit_DMA(handle, tx_dma_stage->data(), static_cast<uint16_t>(len)) !=
-            HAL_OK)
-        {
-            ctx->tx_busy = false;
-            return types::status::error;
-        }
-        return types::status::ok;
-    }
-
-    if (HAL_UART_Transmit(handle, const_cast<uint8_t*>(data), static_cast<uint16_t>(len),
-                          timeout_ms) != HAL_OK)
-    {
-        return types::status::error;
-    }
-
-    return types::status::ok;
-}
-
-types::status start_rx_to_idle(port port, bsp::dma::buffer_view buffer, rx_callback callback,
-                               TX_SEMAPHORE* notify_sem)
-{
-    if (!bsp::dma::valid(buffer))
-    {
-        return types::status::invalid_arg;
-    }
-
-    if (port >= port_count)
-    {
-        return types::status::invalid_arg;
-    }
-
-    if (!port_enabled(port))
-    {
-        return types::status::not_configured;
-    }
-
-    UART_HandleTypeDef* handle = handle_of(port);
-    port_state* ctx = state_of(port);
-    if (handle == nullptr || ctx == nullptr || !ctx->initialized)
-    {
-        return types::status::error;
-    }
-
-    if (ctx->rx_buffer.data() != nullptr &&
-        !same_rx_owner(*ctx, buffer, callback, notify_sem))
-    {
-        return types::status::busy;
-    }
-
-    if (!prepare_rx_dma_buffer(buffer))
-    {
-        return types::status::invalid_arg;
-    }
-
-    // 启动 DMA 前先发布接收 owner；HAL 一启用接收就可能到达 IDLE 中断。
-    const port_state previous = *ctx;
-    ctx->rx_buffer = buffer;
-    ctx->rx_position = 0;
-    ctx->callback = callback;
-    ctx->notify_sem = notify_sem;
-
-    if (HAL_UARTEx_ReceiveToIdle_DMA(handle, buffer.data(),
-                                     static_cast<uint16_t>(buffer.logical_size())) != HAL_OK)
-    {
-        *ctx = previous;
-        return types::status::error;
-    }
-
-    disable_rx_half_transfer_irq(handle);
-
-    return types::status::ok;
-}
-
 } // namespace bsp::usart
 
-extern "C" void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef* huart, uint16_t size)
+extern "C" void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef* native, uint16_t size)
 {
-    bsp::usart::receive(huart, size);
+    bsp::usart::receive(native, size);
 }
 
-extern "C" void HAL_UART_ErrorCallback(UART_HandleTypeDef* huart)
+extern "C" void HAL_UART_ErrorCallback(UART_HandleTypeDef* native)
 {
-    bsp::usart::handle_error(huart);
+    bsp::usart::error(native);
 }
 
-extern "C" void HAL_UART_TxCpltCallback(UART_HandleTypeDef* huart)
+extern "C" void HAL_UART_TxCpltCallback(UART_HandleTypeDef* native)
 {
-    bsp::usart::handle_tx_complete(huart);
+    bsp::usart::transmitted(native);
 }

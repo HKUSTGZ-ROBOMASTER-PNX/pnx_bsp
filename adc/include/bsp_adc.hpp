@@ -1,55 +1,54 @@
 #pragma once
 
-#include "adc.h"
-#include "bsp_dma.hpp"
+#include "main.h"
 #include "config.hpp"
-#include "usertypes.hpp"
+#include "memory.hpp"
+#include "status.hpp"
 
-#include <cstddef>
-#include <cstdint>
+#if defined(HAL_ADC_MODULE_ENABLED)
+#include "adc.h"
 
 namespace bsp::adc
 {
-
-constexpr bool is_enabled(channel channel_id)
-{
-    return static_cast<std::size_t>(channel_id) < channel_count;
-}
-
 struct conversion_state
 {
     volatile bool busy = false;
     volatile bool complete = false;
     volatile bool dma = false;
-    volatile types::status last_status = types::status::ok;
-    volatile std::uint32_t last_value = 0U;
+    volatile pnxtypes::status last_status = pnxtypes::status::ok;
+    volatile uint32_t last_value = 0;
 };
 
-types::status init(channel channel_id);
-types::status calibrate(channel channel_id);
-types::status read_raw(channel channel_id, std::uint32_t& raw_value, std::uint32_t timeout_ms);
-types::status start_it(channel channel_id);
-// The DMA buffer contains uint32_t samples and must be a static bsp::dma::buffer<N>
-// object placed with BSP_DMA_BUFFER.
-types::status start_dma(channel channel_id, bsp::dma::buffer_view buffer);
-types::status stop_dma(channel channel_id);
-const conversion_state& state(channel channel_id) noexcept;
-void handle_conversion_complete(ADC_HandleTypeDef* handle) noexcept;
-void handle_error(ADC_HandleTypeDef* handle) noexcept;
+// CubeMX initializes ADC first. Serialize calls from foreground tasks.
+pnxtypes::status init(const config& resource) noexcept;
+pnxtypes::status calibrate(handle instance) noexcept;
+pnxtypes::status read_raw(handle instance, uint32_t& value, uint32_t timeout_ms) noexcept;
 
+// Async operations retain ownership after completion/error until the matching stop.
+pnxtypes::status start_it(handle instance) noexcept;
+pnxtypes::status stop_it(handle instance) noexcept;
+
+const conversion_state& state(handle instance) noexcept;
+
+// Raw entry requires static, padded D1 storage. Prefer the buffer overload below.
+pnxtypes::status start_dma(handle instance, uint8_t* data, uint32_t size,
+                           uint32_t capacity) noexcept;
+pnxtypes::status stop_dma(handle instance) noexcept;
+
+// N is bytes; each ADC sample occupies four bytes. Keep storage alive and do
+// not access it until successful completion or stop. Stop before restarting or reuse.
+template <uint32_t N>
+pnxtypes::status start_dma(handle instance, memory::buffer<N>& samples) noexcept
+{
+    if (!memory::valid(samples))
+    {
+        return pnxtypes::status::invalid_arg;
+    }
+    return start_dma(instance, samples.data(), samples.logical_size(), samples.capacity());
+}
+
+// HAL callbacks are forwarded by this module; ADC/DMA IRQ handlers belong to the board.
+void handle_conversion_complete(ADC_HandleTypeDef* adc) noexcept;
+void handle_error(ADC_HandleTypeDef* adc) noexcept;
 } // namespace bsp::adc
-
-namespace bsp::adc::detail
-{
-
-struct binding
-{
-    ADC_HandleTypeDef* adc = nullptr;
-    std::uint32_t hal_channel = 0;
-    std::uint32_t rank = 0;
-    std::uint32_t sampling_time = 0;
-};
-
-bool binding_for(channel channel_id, binding& out) noexcept;
-
-} // namespace bsp::adc::detail
+#endif

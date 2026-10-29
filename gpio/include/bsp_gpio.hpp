@@ -1,27 +1,62 @@
 #pragma once
-
 #include "config.hpp"
-#include "usertypes.hpp"
+#include "status.hpp"
+#include "peripherals.hpp"
 
 namespace bsp::gpio
 {
+using pnxtypes::status;
 
-constexpr bool is_enabled(input input_id)
+inline status read(const config& pin, bool& high) noexcept
 {
-    const auto index = static_cast<std::size_t>(input_id);
-    return index < input_count && input_configs[index].port != port_id::none;
+    auto* port = peripherals::gpio_port(pin.instance);
+    const auto mask = peripherals::gpio_pin(pin.pin);
+    if (port == nullptr || mask == 0)
+    {
+        return status::not_configured;
+    }
+    high = HAL_GPIO_ReadPin(port, mask) == GPIO_PIN_SET;
+    return status::ok;
 }
 
-constexpr bool is_enabled(output output_id)
+inline status is_active(const config& pin, bool& active) noexcept
 {
-    const auto index = static_cast<std::size_t>(output_id);
-    return index < output_count && output_configs[index].port != port_id::none;
+    bool high;
+    const auto result = read(pin, high);
+    if (result == status::ok)
+    {
+        active = high == (pin.active == active_level::high);
+    }
+    return result;
 }
 
-types::status read(input input_id, bool& is_high);
-types::status is_active(input input_id, bool& active);
-types::status write(output output_id, bool is_high);
-types::status set_active(output output_id, bool active);
-types::status toggle(output output_id);
+inline status write(const config& pin, bool high) noexcept
+{
+    auto* port = peripherals::gpio_port(pin.instance);
+    const auto mask = peripherals::gpio_pin(pin.pin);
+    if (port == nullptr || mask == 0)
+    {
+        return status::not_configured;
+    }
+    HAL_GPIO_WritePin(port, mask, high ? GPIO_PIN_SET : GPIO_PIN_RESET);
+    return status::ok;
+}
+
+inline status set_active(const config& pin, bool active) noexcept
+{
+    return write(pin, active == (pin.active == active_level::high));
+}
+
+inline status toggle(const config& pin) noexcept
+{
+    auto* port = peripherals::gpio_port(pin.instance);
+    const auto mask = peripherals::gpio_pin(pin.pin);
+    if (port == nullptr || mask == 0)
+    {
+        return status::not_configured;
+    }
+    HAL_GPIO_TogglePin(port, mask);
+    return status::ok;
+}
 
 } // namespace bsp::gpio
