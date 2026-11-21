@@ -35,6 +35,7 @@ struct controller
     uint32_t tx_capacity = 0;
     volatile phase lifecycle = phase::unprepared;
     volatile status last_status = status::not_initialized;
+    volatile uint32_t error_history = HAL_FDCAN_ERROR_NONE;
     bool semaphore_ready = false;
     TX_SEMAPHORE errors{};
     rx_callback callbacks[max_rx_callbacks]{};
@@ -437,6 +438,14 @@ extern "C" void HAL_FDCAN_RxFifo1Callback(FDCAN_HandleTypeDef* native, uint32_t 
 
 extern "C" void HAL_FDCAN_ErrorCallback(FDCAN_HandleTypeDef* native)
 {
+    // HAL retains ErrorCode across IRQs; acknowledge the snapshot after recording it.
+    const uint32_t errors = native->ErrorCode;
+    native->ErrorCode = HAL_FDCAN_ERROR_NONE;
+    auto* item = bsp::can::find(native);
+    if (item != nullptr)
+    {
+        item->error_history |= errors;
+    }
     bsp::can::notify_error(native);
 }
 
